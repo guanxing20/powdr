@@ -1,37 +1,45 @@
 use derive_more::From;
 use eyre::Result;
-use itertools::multiunzip;
+use itertools::{multiunzip, Itertools};
 use openvm_build::{build_guest_package, find_unique_executable, get_package, TargetFilter};
+use openvm_circuit::arch::InitFileGenerator;
 use openvm_circuit::arch::{
-    instructions::exe::VmExe, segment::DefaultSegmentationStrategy, InstructionExecutor, Streams,
-    SystemConfig, VirtualMachine, VmChipComplex, VmConfig, VmInventoryError,
+    instructions::exe::VmExe, segment::DefaultSegmentationStrategy, Streams, SystemConfig,
+    VirtualMachine, VmChipComplex, VmConfig, VmInventoryError,
 };
 use openvm_circuit::{circuit_derive::Chip, derive::AnyEnum};
+use openvm_circuit_derive::InstructionExecutor;
 use openvm_circuit_primitives_derive::ChipUsageGetter;
+use openvm_instructions::program::Program;
 use openvm_sdk::{
     config::{AggStarkConfig, AppConfig, SdkVmConfig, SdkVmConfigExecutor, SdkVmConfigPeriphery},
     keygen::AggStarkProvingKey,
     prover::AggStarkProver,
     Sdk, StdIn,
 };
-use openvm_stark_backend::{config::StarkGenericConfig, engine::StarkEngine, rap::AnyRap, Chip};
+use openvm_stark_backend::engine::StarkEngine;
 use openvm_stark_sdk::config::{
     baby_bear_poseidon2::{BabyBearPoseidon2Config, BabyBearPoseidon2Engine},
     FriParameters,
 };
 use openvm_stark_sdk::engine::StarkFriEngine;
-use openvm_stark_sdk::openvm_stark_backend::{
-    config::Val,
-    p3_field::{Field, PrimeField32},
-};
+use openvm_stark_sdk::openvm_stark_backend::p3_field::PrimeField32;
+use openvm_stark_sdk::p3_baby_bear::BabyBear;
+use powdr_autoprecompiles::PowdrConfig;
 use powdr_extension::{PowdrExecutor, PowdrExtension, PowdrPeriphery};
-use powdr_number::{BabyBearField, FieldElement, LargeInt};
 use serde::{Deserialize, Serialize};
+use std::cmp::Reverse;
+use std::fs::File;
+use std::io::BufWriter;
+use std::iter::Sum;
+use std::ops::Add;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
+use strum::{Display, EnumString};
 
 use tracing::dispatcher::Dispatch;
 use tracing::field::Field as TracingField;
@@ -43,38 +51,42 @@ use tracing_subscriber::{
     Layer,
 };
 
-use crate::extraction_utils::{export_pil, get_airs_and_bus_map, get_constraints};
-use crate::traits::OpenVmField;
+#[cfg(test)]
+use crate::extraction_utils::AirWidthsDiff;
+use crate::extraction_utils::{export_pil, AirWidths, OriginalVmConfig};
+use crate::instruction_formatter::openvm_opcode_formatter;
+use crate::powdr_extension::PowdrPrecompile;
 
 mod air_builder;
 pub mod bus_map;
 pub mod extraction_utils;
-mod instruction_blacklist;
 pub mod opcode;
 pub mod symbolic_instruction_builder;
 mod utils;
+pub use opcode::instruction_allowlist;
+pub use powdr_autoprecompiles::DegreeBound;
+pub use powdr_autoprecompiles::PgoConfig;
 
 type BabyBearSC = BabyBearPoseidon2Config;
-type PowdrBB = powdr_number::BabyBearField;
 
-pub use instruction_blacklist::instruction_blacklist;
-pub use powdr_autoprecompiles::DegreeBound;
-pub use traits::IntoOpenVm;
+// TODO: These constants should be related
+const APP_LOG_BLOWUP: usize = 2;
+pub const OPENVM_DEGREE_BOUND: usize = 5;
+const DEFAULT_DEGREE_BOUND: DegreeBound = DegreeBound {
+    identities: OPENVM_DEGREE_BOUND,
+    bus_interactions: OPENVM_DEGREE_BOUND - 1,
+};
 
-impl IntoOpenVm for PowdrBB {
-    type Field = openvm_stark_sdk::p3_baby_bear::BabyBear;
+pub fn default_powdr_openvm_config(apc: u64, skip: u64) -> PowdrConfig {
+    PowdrConfig::new(apc, skip, DEFAULT_DEGREE_BOUND, POWDR_OPCODE)
+}
 
-    fn into_openvm_field(self) -> Self::Field {
-        use openvm_stark_backend::p3_field::FieldAlgebra;
-        openvm_stark_sdk::p3_baby_bear::BabyBear::from_canonical_u32(
-            self.to_integer().try_into_u32().unwrap(),
-        )
-    }
-
-    fn from_openvm_field(field: Self::Field) -> Self {
-        BabyBearField::from(
-            <Self::Field as openvm_stark_backend::p3_field::PrimeField32>::as_canonical_u32(&field),
-        )
+fn format_fe<F: PrimeField32>(v: F) -> String {
+    let v = v.as_canonical_u32();
+    if v < F::ORDER_U32 / 2 {
+        format!("{v}")
+    } else {
+        format!("-{}", F::ORDER_U32 - v)
     }
 }
 
@@ -84,91 +96,65 @@ pub use powdr_autoprecompiles::bus_map::{BusMap, BusType};
 /// We do not use the transpiler, instead we customize an already transpiled program
 mod customize_exe;
 
-pub use customize_exe::{customize, OPENVM_DEGREE_BOUND, POWDR_OPCODE};
+pub use customize_exe::{customize, BabyBearOpenVmApcAdapter, Instr, POWDR_OPCODE};
 
 // A module for our extension
 mod powdr_extension;
 
 pub mod bus_interaction_handler;
 mod instruction_formatter;
-mod traits;
 
 mod plonk;
 
-/// Three modes for profiler guided optimization with different cost functions to sort the basic blocks by descending cost and select the most costly ones to accelerate.
-/// The inner HashMap contains number of time a pc is executed.
-#[derive(Default)]
-pub enum PgoConfig {
+#[derive(Copy, Clone, Debug, EnumString, Display)]
+#[strum(serialize_all = "lowercase")]
+pub enum PgoType {
     /// cost = cells saved per apc * times executed
-    Cell(HashMap<u32, u32>),
+    /// max total columns
+    Cell(Option<usize>),
     /// cost = instruction per apc * times executed
-    Instruction(HashMap<u32, u32>),
-    /// disable PGO
-    #[default]
+    Instruction,
+    /// cost = instruction per apc
     None,
+}
+
+impl Default for PgoType {
+    fn default() -> Self {
+        PgoType::Cell(None)
+    }
 }
 
 /// A custom VmConfig that wraps the SdkVmConfig, adding our custom extension.
 #[derive(Serialize, Deserialize, Clone)]
-#[serde(bound = "P::Field: Field")]
-pub struct SpecializedConfig<P: IntoOpenVm> {
-    pub sdk_config: SdkVmConfig,
-    powdr: PowdrExtension<P>,
+pub struct SpecializedConfig {
+    pub sdk_config: OriginalVmConfig,
+    pub powdr: PowdrExtension<BabyBear>,
+}
+
+// For generation of the init file, we delegate to the underlying SdkVmConfig.
+impl InitFileGenerator for SpecializedConfig {
+    fn generate_init_file_contents(&self) -> Option<String> {
+        self.sdk_config.config().generate_init_file_contents()
+    }
+
+    fn write_to_init_file(
+        &self,
+        manifest_dir: &Path,
+        init_file_name: Option<&str>,
+    ) -> eyre::Result<()> {
+        self.sdk_config
+            .config()
+            .write_to_init_file(manifest_dir, init_file_name)
+    }
 }
 
 #[allow(clippy::large_enum_variant)]
-#[derive(ChipUsageGetter, From, AnyEnum)]
-pub enum SpecializedExecutor<P: IntoOpenVm> {
+#[derive(ChipUsageGetter, From, AnyEnum, InstructionExecutor, Chip)]
+pub enum SpecializedExecutor<F: PrimeField32> {
     #[any_enum]
-    SdkExecutor(SdkVmConfigExecutor<OpenVmField<P>>),
+    SdkExecutor(SdkVmConfigExecutor<F>),
     #[any_enum]
-    PowdrExecutor(PowdrExecutor<P>),
-}
-
-// These implementations could normally be derived by the `InstructionExecutorDerive` and `Chip` macros,
-// but they don't work with the field types above.
-impl<SC: StarkGenericConfig, P: IntoOpenVm<Field = Val<SC>>> Chip<SC> for SpecializedExecutor<P>
-where
-    Val<SC>: PrimeField32,
-{
-    fn generate_air_proof_input(self) -> openvm_stark_backend::prover::types::AirProofInput<SC> {
-        match self {
-            SpecializedExecutor::SdkExecutor(executor) => executor.generate_air_proof_input(),
-            SpecializedExecutor::PowdrExecutor(executor) => executor.generate_air_proof_input(),
-        }
-    }
-
-    fn air(&self) -> std::sync::Arc<dyn AnyRap<SC>> {
-        match self {
-            SpecializedExecutor::SdkExecutor(executor) => executor.air(),
-            SpecializedExecutor::PowdrExecutor(executor) => executor.air(),
-        }
-    }
-}
-
-impl<P: IntoOpenVm> InstructionExecutor<OpenVmField<P>> for SpecializedExecutor<P> {
-    fn execute(
-        &mut self,
-        memory: &mut openvm_circuit::system::memory::MemoryController<OpenVmField<P>>,
-        instruction: &openvm_instructions::instruction::Instruction<OpenVmField<P>>,
-        from_state: openvm_circuit::arch::ExecutionState<u32>,
-    ) -> openvm_circuit::arch::Result<openvm_circuit::arch::ExecutionState<u32>> {
-        match self {
-            SpecializedExecutor::SdkExecutor(executor) => {
-                executor.execute(memory, instruction, from_state)
-            }
-            SpecializedExecutor::PowdrExecutor(executor) => {
-                executor.execute(memory, instruction, from_state)
-            }
-        }
-    }
-
-    fn get_opcode_name(&self, opcode: usize) -> String {
-        match self {
-            SpecializedExecutor::SdkExecutor(executor) => executor.get_opcode_name(opcode),
-            SpecializedExecutor::PowdrExecutor(executor) => executor.get_opcode_name(opcode),
-        }
-    }
+    PowdrExecutor(PowdrExecutor<F>),
 }
 
 #[derive(From, ChipUsageGetter, Chip, AnyEnum)]
@@ -179,22 +165,21 @@ pub enum MyPeriphery<F: PrimeField32> {
     PowdrPeriphery(PowdrPeriphery<F>),
 }
 
-impl<P: IntoOpenVm> VmConfig<OpenVmField<P>> for SpecializedConfig<P> {
-    type Executor = SpecializedExecutor<P>;
-    type Periphery = MyPeriphery<OpenVmField<P>>;
+impl VmConfig<BabyBear> for SpecializedConfig {
+    type Executor = SpecializedExecutor<BabyBear>;
+    type Periphery = MyPeriphery<BabyBear>;
 
     fn system(&self) -> &SystemConfig {
-        VmConfig::<OpenVmField<P>>::system(&self.sdk_config)
+        VmConfig::<BabyBear>::system(self.sdk_config.config())
     }
 
     fn system_mut(&mut self) -> &mut SystemConfig {
-        VmConfig::<OpenVmField<P>>::system_mut(&mut self.sdk_config)
+        VmConfig::<BabyBear>::system_mut(self.sdk_config.config_mut())
     }
 
     fn create_chip_complex(
         &self,
-    ) -> Result<VmChipComplex<OpenVmField<P>, Self::Executor, Self::Periphery>, VmInventoryError>
-    {
+    ) -> Result<VmChipComplex<BabyBear, Self::Executor, Self::Periphery>, VmInventoryError> {
         let chip = self.sdk_config.create_chip_complex()?;
         let chip = chip.extend(&self.powdr)?;
 
@@ -202,9 +187,25 @@ impl<P: IntoOpenVm> VmConfig<OpenVmField<P>> for SpecializedConfig<P> {
     }
 }
 
-impl<P: IntoOpenVm> SpecializedConfig<P> {
-    pub fn from_base_and_extension(sdk_config: SdkVmConfig, powdr: PowdrExtension<P>) -> Self {
-        Self { sdk_config, powdr }
+impl SpecializedConfig {
+    fn new(
+        base_config: OriginalVmConfig,
+        precompiles: Vec<PowdrPrecompile<BabyBear>>,
+        implementation: PrecompileImplementation,
+    ) -> Self {
+        let airs = base_config.airs().expect("Failed to convert the AIR of an OpenVM instruction, even after filtering by the blacklist!");
+        let bus_map = base_config.bus_map();
+        let powdr_extension = PowdrExtension::new(
+            precompiles,
+            base_config.config().clone(),
+            implementation,
+            bus_map,
+            airs,
+        );
+        Self {
+            sdk_config: base_config,
+            powdr: powdr_extension,
+        }
     }
 }
 
@@ -233,16 +234,7 @@ pub fn build_elf_path<P: AsRef<Path>>(
 pub fn compile_openvm(
     guest: &str,
     guest_opts: GuestOptions,
-) -> Result<OriginalCompiledProgram<BabyBearField>, Box<dyn std::error::Error>> {
-    // wrap the sdk config (with the standard extensions) in our custom config (with our custom extension)
-    let sdk_vm_config = SdkVmConfig::builder()
-        .system(Default::default())
-        .rv32i(Default::default())
-        .rv32m(Default::default())
-        .io(Default::default())
-        .keccak(Default::default())
-        .build();
-
+) -> Result<OriginalCompiledProgram, Box<dyn std::error::Error>> {
     let sdk = Sdk::default();
 
     // Build the ELF with guest options and a target filter.
@@ -255,7 +247,28 @@ pub fn compile_openvm(
     path.push(guest);
     let target_path = path.to_str().unwrap();
 
-    let elf = sdk.build(guest_opts, target_path, &Default::default())?;
+    // try to load the sdk config from the openvm.toml file, otherwise use the default
+    let openvm_toml_path = path.join("openvm.toml");
+    let sdk_vm_config = if openvm_toml_path.exists() {
+        let toml = std::fs::read_to_string(&openvm_toml_path)?;
+        let app_config: AppConfig<_> = toml::from_str(&toml)?;
+        app_config.app_vm_config
+    } else {
+        SdkVmConfig::builder()
+            .system(Default::default())
+            .rv32i(Default::default())
+            .rv32m(Default::default())
+            .io(Default::default())
+            .build()
+    };
+
+    let elf = sdk.build(
+        guest_opts,
+        &sdk_vm_config,
+        target_path,
+        &Default::default(),
+        Default::default(),
+    )?;
 
     // Transpile the ELF into a VmExe. Note that this happens using the sdk transpiler only, our extension does not use a transpiler.
     let exe = sdk.transpile(elf, sdk_vm_config.transpiler())?;
@@ -274,74 +287,75 @@ pub enum PrecompileImplementation {
     PlonkChip,
 }
 
-#[derive(Clone)]
-pub struct PowdrConfig {
-    /// Number of autoprecompiles to generate.
-    pub autoprecompiles: u64,
-    /// Number of basic blocks to skip for autoprecompiles.
-    /// This is either the largest N if no PGO, or the costliest N with PGO.
-    pub skip_autoprecompiles: u64,
-    /// Max degree of constraints.
-    pub degree_bound: DegreeBound,
-    /// Implementation of the precompile, i.e., how to compile it to a RAP.
-    pub implementation: PrecompileImplementation,
-}
-
-impl PowdrConfig {
-    pub fn new(autoprecompiles: u64, skip_autoprecompiles: u64) -> Self {
-        Self {
-            autoprecompiles,
-            skip_autoprecompiles,
-            degree_bound: DegreeBound {
-                identities: customize_exe::OPENVM_DEGREE_BOUND,
-                bus_interactions: customize_exe::OPENVM_DEGREE_BOUND - 1,
-            },
-            implementation: PrecompileImplementation::default(),
-        }
-    }
-
-    pub fn with_autoprecompiles(self, autoprecompiles: u64) -> Self {
-        Self {
-            autoprecompiles,
-            ..self
-        }
-    }
-
-    pub fn with_degree_bound(self, degree_bound: DegreeBound) -> Self {
-        Self {
-            degree_bound,
-            ..self
-        }
-    }
-
-    pub fn with_precompile_implementation(
-        self,
-        precompile_implementation: PrecompileImplementation,
-    ) -> Self {
-        Self {
-            implementation: precompile_implementation,
-            ..self
-        }
-    }
-}
-
 pub fn compile_guest(
     guest: &str,
     guest_opts: GuestOptions,
     config: PowdrConfig,
+    implementation: PrecompileImplementation,
     pgo_config: PgoConfig,
-) -> Result<CompiledProgram<BabyBearField>, Box<dyn std::error::Error>> {
+) -> Result<CompiledProgram, Box<dyn std::error::Error>> {
     let original_program = compile_openvm(guest, guest_opts.clone())?;
-    compile_exe(guest, guest_opts, original_program, config, pgo_config)
+
+    // Optional tally of opcode freqency (only enabled for debug level logs)
+    if tracing::enabled!(Level::DEBUG) {
+        tally_opcode_frequency(&pgo_config, &original_program.exe);
+    }
+
+    compile_exe(
+        guest,
+        guest_opts,
+        original_program,
+        config,
+        implementation,
+        pgo_config,
+    )
+}
+
+fn tally_opcode_frequency(pgo_config: &PgoConfig, exe: &VmExe<BabyBear>) {
+    let pgo_program_idx_count = match pgo_config {
+        PgoConfig::Cell(pgo_program_idx_count, _)
+        | PgoConfig::Instruction(pgo_program_idx_count) => {
+            // If execution count of each pc is available, we tally the opcode execution frequency
+            tracing::debug!("Opcode execution frequency:");
+            pgo_program_idx_count
+        }
+        PgoConfig::None => {
+            // If execution count of each pc isn't available, we just count the occurrences of each opcode in the program
+            tracing::debug!("Opcode frequency in program:");
+            // Create a dummy HashMap that returns 1 for each pc
+            &(0..exe.program.instructions_and_debug_infos.len())
+                .map(|i| (i as u32, 1))
+                .collect::<HashMap<_, _>>()
+        }
+    };
+
+    exe.program
+        .instructions_and_debug_infos
+        .iter()
+        .enumerate()
+        .fold(HashMap::new(), |mut acc, (i, instr)| {
+            let opcode = instr.as_ref().unwrap().0.opcode;
+            if let Some(count) = pgo_program_idx_count.get(&(i as u32)) {
+                *acc.entry(opcode).or_insert(0) += count;
+            }
+            acc
+        })
+        .into_iter()
+        .sorted_by_key(|(_, count)| Reverse(*count))
+        .for_each(|(opcode, count)| {
+            // Log the opcode and its count
+            tracing::debug!("   {}: {count}", openvm_opcode_formatter(&opcode));
+        });
 }
 
 pub fn compile_exe(
     guest: &str,
     guest_opts: GuestOptions,
-    original_program: OriginalCompiledProgram<BabyBearField>,
+    original_program: OriginalCompiledProgram,
     config: PowdrConfig,
+    implementation: PrecompileImplementation,
     pgo_config: PgoConfig,
-) -> Result<CompiledProgram<BabyBearField>, Box<dyn std::error::Error>> {
+) -> Result<CompiledProgram, Box<dyn std::error::Error>> {
     // Build the ELF with guest options and a target filter.
     // We need these extra Rust flags to get the labels.
     let guest_opts = guest_opts.with_rustc_flags(vec!["-C", "link-arg=--emit-relocs"]);
@@ -352,96 +366,137 @@ pub fn compile_exe(
     path.push(guest);
     let target_path = path.to_str().unwrap();
 
-    let elf_binary = build_elf_path(guest_opts.clone(), target_path, &Default::default())?;
-    let elf_powdr = powdr_riscv_elf::load_elf(&elf_binary);
+    let elf_binary_path = build_elf_path(guest_opts.clone(), target_path, &Default::default())?;
 
-    let blacklist = instruction_blacklist();
-    let used_instructions = original_program
-        .exe
-        .program
-        .instructions_and_debug_infos
-        .iter()
-        .map(|instr| instr.as_ref().unwrap().0.opcode)
-        .filter(|opcode| !blacklist.contains(&opcode.as_usize()))
-        .collect();
-    let (airs, bus_map) =
-        get_airs_and_bus_map(original_program.sdk_vm_config.clone(), &used_instructions)
-            .expect("Failed to convert the AIR of an OpenVM instruction, even after filtering by the blacklist!");
-
-    let sdk_vm_config = original_program.sdk_vm_config.clone();
-
-    let (exe, extension) = customize_exe::customize(
+    compile_exe_with_elf(
         original_program,
-        &elf_powdr.text_labels,
-        &airs,
-        config.clone(),
-        bus_map.clone(),
+        &std::fs::read(elf_binary_path)?,
+        config,
+        implementation,
+        pgo_config,
+    )
+}
+
+pub fn compile_exe_with_elf(
+    original_program: OriginalCompiledProgram,
+    elf: &[u8],
+    config: PowdrConfig,
+    implementation: PrecompileImplementation,
+    pgo_config: PgoConfig,
+) -> Result<CompiledProgram, Box<dyn std::error::Error>> {
+    let elf = powdr_riscv_elf::load_elf_from_buffer(elf);
+    let compiled = customize(
+        original_program,
+        elf.text_labels(),
+        elf.debug_info(),
+        config,
+        implementation,
         pgo_config,
     );
-    // Generate the custom config based on the generated instructions
-    let vm_config = SpecializedConfig::from_base_and_extension(sdk_vm_config, extension);
-    export_pil(vm_config.clone(), "debug.pil", &["KeccakVmAir"], &bus_map);
-
-    Ok(CompiledProgram { exe, vm_config })
+    // Export the compiled program to a PIL file for debugging purposes.
+    export_pil(
+        &mut BufWriter::new(File::create("debug.pil").unwrap()),
+        &compiled.vm_config,
+    );
+    Ok(compiled)
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-#[serde(bound = "P::Field: Field")]
-pub struct CompiledProgram<P: IntoOpenVm> {
-    pub exe: VmExe<OpenVmField<P>>,
-    pub vm_config: SpecializedConfig<P>,
+pub struct CompiledProgram {
+    pub exe: VmExe<BabyBear>,
+    pub vm_config: SpecializedConfig,
 }
 
 // the original openvm program and config without powdr extension
 #[derive(Clone)]
-pub struct OriginalCompiledProgram<P: IntoOpenVm> {
-    pub exe: VmExe<OpenVmField<P>>,
+pub struct OriginalCompiledProgram {
+    pub exe: VmExe<BabyBear>,
     pub sdk_vm_config: SdkVmConfig,
 }
 
+#[derive(Clone, Serialize, Deserialize, Default, Debug, Eq, PartialEq)]
 pub struct AirMetrics {
-    pub name: String,
-    pub width: usize,
+    pub widths: AirWidths,
     pub constraints: usize,
     pub bus_interactions: usize,
 }
 
-impl CompiledProgram<PowdrBB> {
-    pub fn powdr_airs_metrics(&self) -> Vec<AirMetrics> {
-        let chip_complex: VmChipComplex<_, _, _> = self.vm_config.create_chip_complex().unwrap();
+impl Add for AirMetrics {
+    type Output = AirMetrics;
 
-        chip_complex
-            .inventory
-            .executors()
-            .iter()
-            .filter_map(|executor| {
-                let air = executor.air();
-                let width = air.width();
-                let name = air.name();
-
-                // We actually give name "powdr_air_for_opcode_<opcode>" to the AIRs,
-                // but OpenVM uses the actual Rust type (PowdrAir) as the name in this method.
-                // TODO this is hacky but not sure how to do it better rn.
-                if name.starts_with("PowdrAir") || name.starts_with("PlonkAir") {
-                    let constraints = get_constraints(air);
-                    Some(AirMetrics {
-                        name: name.to_string(),
-                        width,
-                        constraints: constraints.constraints.len(),
-                        bus_interactions: constraints.interactions.len(),
-                    })
-                } else {
-                    None
-                }
-            })
-            .collect()
+    fn add(self, rhs: AirMetrics) -> AirMetrics {
+        AirMetrics {
+            widths: self.widths + rhs.widths,
+            constraints: self.constraints + rhs.constraints,
+            bus_interactions: self.bus_interactions + rhs.bus_interactions,
+        }
     }
 }
 
-pub fn execute(
-    program: CompiledProgram<PowdrBB>,
-    inputs: StdIn,
-) -> Result<(), Box<dyn std::error::Error>> {
+impl Sum<AirMetrics> for AirMetrics {
+    fn sum<I: Iterator<Item = AirMetrics>>(iter: I) -> AirMetrics {
+        iter.fold(AirMetrics::default(), Add::add)
+    }
+}
+
+impl AirMetrics {
+    pub fn total_width(&self) -> usize {
+        self.widths.total()
+    }
+}
+
+#[cfg(test)]
+impl CompiledProgram {
+    // Return a tuple of (powdr AirMetrics, non-powdr AirMetrics)
+    fn air_metrics(&self) -> (Vec<(AirMetrics, Option<AirWidthsDiff>)>, Vec<AirMetrics>) {
+        use openvm_stark_backend::Chip;
+
+        use crate::extraction_utils::get_air_metrics;
+
+        let inventory = self.vm_config.create_chip_complex().unwrap().inventory;
+
+        // Order of precompile is the same as that of Powdr executors in chip inventory
+        let mut apc_stats = self
+            .vm_config
+            .powdr
+            .precompiles
+            .iter()
+            .map(|precompile| precompile.apc_stats.clone());
+
+        inventory
+            .executors()
+            .iter()
+            .map(|executor| executor.air())
+            .chain(
+                inventory
+                    .periphery()
+                    .iter()
+                    .map(|periphery| periphery.air()),
+            )
+            .fold(
+                (Vec::new(), Vec::new()),
+                |(mut powdr_air_metrics, mut non_powdr_air_metrics), air| {
+                    let name = air.name();
+
+                    // We actually give name "powdr_air_for_opcode_<opcode>" to the AIRs,
+                    // but OpenVM uses the actual Rust type (PowdrAir) as the name in this method.
+                    // TODO this is hacky but not sure how to do it better rn.
+                    if name.starts_with("PowdrAir") || name.starts_with("PlonkAir") {
+                        powdr_air_metrics.push((
+                            get_air_metrics(air),
+                            apc_stats.next().unwrap().map(|stats| stats.widths),
+                        ));
+                    } else {
+                        non_powdr_air_metrics.push(get_air_metrics(air));
+                    }
+
+                    (powdr_air_metrics, non_powdr_air_metrics)
+                },
+            )
+    }
+}
+
+pub fn execute(program: CompiledProgram, inputs: StdIn) -> Result<(), Box<dyn std::error::Error>> {
     let CompiledProgram { exe, vm_config } = program;
 
     let sdk = Sdk::default();
@@ -452,65 +507,8 @@ pub fn execute(
     Ok(())
 }
 
-pub fn pgo(
-    program: OriginalCompiledProgram<BabyBearField>,
-    inputs: StdIn,
-) -> Result<HashMap<u32, u32>, Box<dyn std::error::Error>> {
-    // in memory collector storage
-    let collected = Arc::new(Mutex::new(Vec::new()));
-    let collector_layer = PgoCollector {
-        pc: collected.clone(),
-    };
-
-    // build subscriber
-    let subscriber = Registry::default().with(collector_layer);
-
-    // prepare for execute
-    let OriginalCompiledProgram { exe, sdk_vm_config } = program;
-    let sdk = Sdk::default();
-
-    // dispatch constructs a local subscriber at trace level that is invoked during pgo but doesn't override the global one at info level
-    let dispatch = Dispatch::new(subscriber);
-    tracing::dispatcher::with_default(&dispatch, || {
-        sdk.execute(exe.clone(), sdk_vm_config.clone(), inputs)
-            .unwrap();
-    });
-
-    // collect the pc's during execution
-    let pc = collected.lock().unwrap().clone();
-
-    // create pc_index map to times executed, where pc_index = (pc - pc_base) / step
-    let pc_base = exe.program.pc_base;
-    let step = exe.program.step;
-    let pc_index_count = pc
-        .iter()
-        .fold(std::collections::HashMap::new(), |mut acc, pc| {
-            let pc_index = (*pc as u32 - pc_base) / step;
-            *acc.entry(pc_index).or_insert(0u32) += 1;
-            acc
-        });
-
-    // the smallest pc is the same as the base_pc if there's no stdin
-    let pc_min = pc.iter().min().unwrap();
-    tracing::debug!("pc_min: {}; pc_base: {}", pc_min, pc_base);
-
-    // print the total and by pc counts
-    tracing::debug!("Pgo captured {} pc's", pc.len());
-
-    if tracing::enabled!(Level::DEBUG) {
-        // print pc_index map in descending order of pc_index count
-        let mut pc_index_count_sorted: Vec<_> = pc_index_count.iter().collect();
-        pc_index_count_sorted.sort_by(|a, b| b.1.cmp(a.1));
-        pc_index_count_sorted.iter().for_each(|(pc, count)| {
-            tracing::debug!("pc_index {}: {}", pc, count);
-        });
-    }
-
-    Ok(pc_index_count)
-}
-
 pub fn prove(
-    program: &CompiledProgram<PowdrBB>,
+    program: &CompiledProgram,
     mock: bool,
     recursion: bool,
     inputs: StdIn,
@@ -521,7 +519,12 @@ pub fn prove(
 
     // DefaultSegmentationStrategy { max_segment_len: 4194204, max_cells_per_chip_in_segment: 503304480 }
     if let Some(segment_height) = segment_height {
-        vm_config.sdk_config.system.config.segmentation_strategy = Arc::new(
+        vm_config
+            .sdk_config
+            .config_mut()
+            .system
+            .config
+            .segmentation_strategy = Arc::new(
             DefaultSegmentationStrategy::new_with_max_segment_len(segment_height),
         );
         tracing::debug!("Setting max segment len to {}", segment_height);
@@ -530,8 +533,7 @@ pub fn prove(
     let sdk = Sdk::default();
 
     // Set app configuration
-    let app_log_blowup = 2;
-    let app_fri_params = FriParameters::standard_with_100_bits_conjectured_security(app_log_blowup);
+    let app_fri_params = FriParameters::standard_with_100_bits_conjectured_security(APP_LOG_BLOWUP);
     let app_config = AppConfig::new(app_fri_params, vm_config.clone());
 
     // Commit the exe
@@ -543,7 +545,7 @@ pub fn prove(
     if mock {
         tracing::info!("Checking constraints and witness in Mock prover...");
         let engine = BabyBearPoseidon2Engine::new(
-            FriParameters::standard_with_100_bits_conjectured_security(app_log_blowup),
+            FriParameters::standard_with_100_bits_conjectured_security(APP_LOG_BLOWUP),
         );
         let vm = VirtualMachine::new(engine, vm_config.clone());
         let pk = vm.keygen();
@@ -607,11 +609,57 @@ pub fn prove(
     Ok(())
 }
 
-pub fn get_pc_idx_count(guest: &str, guest_opts: GuestOptions, inputs: StdIn) -> HashMap<u32, u32> {
+// Same as execution_profile below but for guest path inputs.
+pub fn execution_profile_from_guest(
+    guest: &str,
+    guest_opts: GuestOptions,
+    inputs: StdIn,
+) -> HashMap<u32, u32> {
     let program = compile_openvm(guest, guest_opts).unwrap();
-    // times executed by program index, where index = (pc - base_pc) / step
-    // help determine the basic blocks to create autoprecompile for
-    pgo(program, inputs).unwrap()
+    execution_profile(program, inputs)
+}
+
+// Produces execution count by pc_index
+// Used in Pgo::Cell and Pgo::Instruction to help rank basic blocks to create APCs for
+pub fn execution_profile(program: OriginalCompiledProgram, inputs: StdIn) -> HashMap<u32, u32> {
+    let OriginalCompiledProgram { exe, sdk_vm_config } = program;
+
+    // in memory collector storage
+    let collector = PgoCollector::new(&exe.program);
+
+    // build subscriber
+    let subscriber = Registry::default().with(collector.clone());
+
+    // prepare for execute
+    let sdk = Sdk::default();
+
+    // dispatch constructs a local subscriber at trace level that is invoked during data collection but doesn't override the global one at info level
+    let dispatch = Dispatch::new(subscriber);
+    tracing::dispatcher::with_default(&dispatch, || {
+        sdk.execute(exe.clone(), sdk_vm_config.clone(), inputs)
+            .unwrap();
+    });
+
+    // Extract the collected data
+    let pc_index_count = collector.into_hashmap();
+
+    // the smallest pc is the same as the pc_base if there's no stdin
+    let pc_min = pc_index_count.keys().min().unwrap();
+    tracing::debug!("pc_min: {}; pc_base: {}", pc_min, exe.program.pc_base);
+
+    // print the total and by pc counts
+    tracing::debug!("Pgo captured {} pc's", pc_index_count.len());
+
+    if tracing::enabled!(Level::TRACE) {
+        // print pc_index map in descending order of pc_index count
+        let mut pc_index_count_sorted: Vec<_> = pc_index_count.iter().collect();
+        pc_index_count_sorted.sort_by(|a, b| b.1.cmp(a.1));
+        pc_index_count_sorted.iter().for_each(|(pc, count)| {
+            tracing::trace!("pc_index {}: {}", pc, count);
+        });
+    }
+
+    pc_index_count
 }
 
 // holds basic type fields of execution objects captured in trace by subscriber
@@ -636,7 +684,44 @@ impl tracing::field::Visit for PgoData {
 // A Layer that collects data we are interested in using for the pgo from the trace fields.
 #[derive(Clone)]
 struct PgoCollector {
-    pc: Arc<Mutex<Vec<usize>>>,
+    step: usize,
+    pc_base: usize,
+    pc_index_map: Arc<Vec<AtomicU32>>,
+}
+
+impl PgoCollector {
+    fn new<F>(program: &Program<F>) -> Self {
+        let max_pc_index = program.instructions_and_debug_infos.len();
+        // create a map with max_pc entries initialized to 0
+        let pc_index_map = Arc::new((0..max_pc_index).map(|_| AtomicU32::new(0)).collect());
+        Self {
+            pc_index_map,
+            step: program.step as usize,
+            pc_base: program.pc_base as usize,
+        }
+    }
+
+    fn into_hashmap(self) -> HashMap<u32, u32> {
+        // Turn the map into a HashMap of (pc_index, count)
+        self.pc_index_map
+            .iter()
+            .enumerate()
+            .filter_map(|(pc_index, count)| {
+                let count = count.load(Ordering::Relaxed);
+
+                // if the count is zero, we skip it
+                if count == 0 {
+                    return None;
+                }
+
+                Some((pc_index as u32, count))
+            })
+            .collect()
+    }
+
+    fn increment(&self, pc: usize) {
+        self.pc_index_map[(pc - self.pc_base) / self.step].fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 impl<S> Layer<S> for PgoCollector
@@ -651,7 +736,7 @@ where
         // because our subscriber is at the trace level, for trace print outs that don't match PgoData,
         // the visitor can't parse them, and these cases are filtered out automatically
         if let Some(pc) = visitor.pc {
-            self.pc.lock().unwrap().push(pc);
+            self.increment(pc);
         }
     }
 }
@@ -661,22 +746,32 @@ mod tests {
     use super::*;
     use test_log::test;
 
+    #[allow(clippy::too_many_arguments)]
     fn compile_and_prove(
         guest: &str,
         config: PowdrConfig,
+        implementation: PrecompileImplementation,
         mock: bool,
         recursion: bool,
         stdin: StdIn,
         pgo_config: PgoConfig,
         segment_height: Option<usize>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let program = compile_guest(guest, GuestOptions::default(), config, pgo_config).unwrap();
+        let program = compile_guest(
+            guest,
+            GuestOptions::default(),
+            config,
+            implementation,
+            pgo_config,
+        )
+        .unwrap();
         prove(&program, mock, recursion, stdin, segment_height)
     }
 
     fn prove_simple(
         guest: &str,
         config: PowdrConfig,
+        implementation: PrecompileImplementation,
         stdin: StdIn,
         pgo_config: PgoConfig,
         segment_height: Option<usize>,
@@ -684,6 +779,7 @@ mod tests {
         let result = compile_and_prove(
             guest,
             config,
+            implementation,
             false,
             false,
             stdin,
@@ -696,6 +792,7 @@ mod tests {
     fn prove_mock(
         guest: &str,
         config: PowdrConfig,
+        implementation: PrecompileImplementation,
         stdin: StdIn,
         pgo_config: PgoConfig,
         segment_height: Option<usize>,
@@ -703,6 +800,7 @@ mod tests {
         let result = compile_and_prove(
             guest,
             config,
+            implementation,
             true,
             false,
             stdin,
@@ -715,6 +813,7 @@ mod tests {
     fn prove_recursion(
         guest: &str,
         config: PowdrConfig,
+        implementation: PrecompileImplementation,
         stdin: StdIn,
         pgo_config: PgoConfig,
         segment_height: Option<usize>,
@@ -722,6 +821,7 @@ mod tests {
         let result = compile_and_prove(
             guest,
             config,
+            implementation,
             false,
             true,
             stdin,
@@ -746,20 +846,42 @@ mod tests {
     const GUEST_KECCAK_APC_PGO_LARGE: u64 = 100;
     const GUEST_KECCAK_SKIP: u64 = 0;
 
+    const GUEST_SHA256_ITER: u32 = 1_000;
+    const GUEST_SHA256_ITER_SMALL: u32 = 10;
+    const GUEST_SHA256_ITER_LARGE: u32 = 25_000;
+    const GUEST_SHA256: &str = "guest-sha256";
+    const GUEST_SHA256_APC_PGO: u64 = 10;
+    const GUEST_SHA256_APC_PGO_LARGE: u64 = 50;
+    const GUEST_SHA256_SKIP: u64 = 0;
+
     #[test]
     fn guest_prove_simple() {
         let mut stdin = StdIn::default();
         stdin.write(&GUEST_ITER);
-        let config = PowdrConfig::new(GUEST_APC, GUEST_SKIP);
-        prove_simple(GUEST, config, stdin, PgoConfig::None, None);
+        let config = default_powdr_openvm_config(GUEST_APC, GUEST_SKIP);
+        prove_simple(
+            GUEST,
+            config,
+            PrecompileImplementation::SingleRowChip,
+            stdin,
+            PgoConfig::None,
+            None,
+        );
     }
 
     #[test]
     fn guest_prove_mock() {
         let mut stdin = StdIn::default();
         stdin.write(&GUEST_ITER);
-        let config = PowdrConfig::new(GUEST_APC, GUEST_SKIP);
-        prove_mock(GUEST, config, stdin, PgoConfig::None, None);
+        let config = default_powdr_openvm_config(GUEST_APC, GUEST_SKIP);
+        prove_mock(
+            GUEST,
+            config,
+            PrecompileImplementation::SingleRowChip,
+            stdin,
+            PgoConfig::None,
+            None,
+        );
     }
 
     // All gate constraints should be satisfied, but bus interactions are not implemented yet.
@@ -767,9 +889,15 @@ mod tests {
     fn guest_plonk_prove_mock() {
         let mut stdin = StdIn::default();
         stdin.write(&GUEST_ITER);
-        let config = PowdrConfig::new(GUEST_APC, GUEST_SKIP)
-            .with_precompile_implementation(PrecompileImplementation::PlonkChip);
-        prove_mock(GUEST, config, stdin, PgoConfig::None, None);
+        let config = default_powdr_openvm_config(GUEST_APC, GUEST_SKIP);
+        prove_mock(
+            GUEST,
+            config,
+            PrecompileImplementation::PlonkChip,
+            stdin,
+            PgoConfig::None,
+            None,
+        );
     }
 
     #[test]
@@ -777,27 +905,63 @@ mod tests {
     fn guest_prove_recursion() {
         let mut stdin = StdIn::default();
         stdin.write(&GUEST_ITER);
-        let config = PowdrConfig::new(GUEST_APC, GUEST_SKIP);
-        let pgo_data = get_pc_idx_count(GUEST, GuestOptions::default(), stdin.clone());
-        prove_recursion(GUEST, config, stdin, PgoConfig::Instruction(pgo_data), None);
+        let config = default_powdr_openvm_config(GUEST_APC, GUEST_SKIP);
+        let pgo_data = execution_profile_from_guest(GUEST, GuestOptions::default(), stdin.clone());
+        prove_recursion(
+            GUEST,
+            config,
+            PrecompileImplementation::SingleRowChip,
+            stdin,
+            PgoConfig::Instruction(pgo_data),
+            None,
+        );
+    }
+
+    #[test]
+    #[ignore = "Too long"]
+    fn matmul_compile() {
+        let guest = "guest-matmul";
+        let config = default_powdr_openvm_config(1, 0);
+        assert!(compile_guest(
+            guest,
+            GuestOptions::default(),
+            config,
+            PrecompileImplementation::SingleRowChip,
+            PgoConfig::default()
+        )
+        .is_ok());
     }
 
     #[test]
     fn keccak_small_prove_simple() {
         let mut stdin = StdIn::default();
         stdin.write(&GUEST_KECCAK_ITER_SMALL);
-        let config = PowdrConfig::new(GUEST_KECCAK_APC, GUEST_KECCAK_SKIP);
-        prove_simple(GUEST_KECCAK, config, stdin, PgoConfig::None, None);
+        let config = default_powdr_openvm_config(GUEST_KECCAK_APC, GUEST_KECCAK_SKIP);
+        prove_simple(
+            GUEST_KECCAK,
+            config,
+            PrecompileImplementation::SingleRowChip,
+            stdin,
+            PgoConfig::None,
+            None,
+        );
     }
 
     #[test]
-    fn kecak_small_prove_simple_multi_segment() {
+    fn keccak_small_prove_simple_multi_segment() {
         // Set the default segmentation height to a small value to test multi-segment proving
         let mut stdin = StdIn::default();
         stdin.write(&GUEST_KECCAK_ITER_SMALL);
-        let config = PowdrConfig::new(GUEST_KECCAK_APC, GUEST_KECCAK_SKIP);
+        let config = default_powdr_openvm_config(GUEST_KECCAK_APC, GUEST_KECCAK_SKIP);
         // should create two segments
-        prove_simple(GUEST_KECCAK, config, stdin, PgoConfig::None, Some(4_000));
+        prove_simple(
+            GUEST_KECCAK,
+            config,
+            PrecompileImplementation::SingleRowChip,
+            stdin,
+            PgoConfig::None,
+            Some(4_000),
+        );
     }
 
     #[test]
@@ -805,8 +969,15 @@ mod tests {
     fn keccak_prove_simple() {
         let mut stdin = StdIn::default();
         stdin.write(&GUEST_KECCAK_ITER);
-        let config = PowdrConfig::new(GUEST_KECCAK_APC, GUEST_KECCAK_SKIP);
-        prove_simple(GUEST_KECCAK, config, stdin, PgoConfig::None, None);
+        let config = default_powdr_openvm_config(GUEST_KECCAK_APC, GUEST_KECCAK_SKIP);
+        prove_simple(
+            GUEST_KECCAK,
+            config,
+            PrecompileImplementation::SingleRowChip,
+            stdin,
+            PgoConfig::None,
+            None,
+        );
     }
 
     #[test]
@@ -814,12 +985,14 @@ mod tests {
     fn keccak_prove_many_apcs() {
         let mut stdin = StdIn::default();
         stdin.write(&GUEST_KECCAK_ITER);
-        let pgo_data = get_pc_idx_count(GUEST_KECCAK, GuestOptions::default(), stdin.clone());
+        let pgo_data =
+            execution_profile_from_guest(GUEST_KECCAK, GuestOptions::default(), stdin.clone());
 
-        let config = PowdrConfig::new(GUEST_KECCAK_APC_PGO_LARGE, GUEST_KECCAK_SKIP);
+        let config = default_powdr_openvm_config(GUEST_KECCAK_APC_PGO_LARGE, GUEST_KECCAK_SKIP);
         prove_recursion(
             GUEST_KECCAK,
             config.clone(),
+            PrecompileImplementation::SingleRowChip,
             stdin.clone(),
             PgoConfig::Instruction(pgo_data.clone()),
             None,
@@ -828,8 +1001,9 @@ mod tests {
         prove_recursion(
             GUEST_KECCAK,
             config.clone(),
+            PrecompileImplementation::SingleRowChip,
             stdin,
-            PgoConfig::Cell(pgo_data),
+            PgoConfig::Cell(pgo_data, None),
             None,
         );
     }
@@ -839,12 +1013,14 @@ mod tests {
     fn keccak_prove_large() {
         let mut stdin = StdIn::default();
         stdin.write(&GUEST_KECCAK_ITER_LARGE);
-        let pgo_data = get_pc_idx_count(GUEST_KECCAK, GuestOptions::default(), stdin.clone());
+        let pgo_data =
+            execution_profile_from_guest(GUEST_KECCAK, GuestOptions::default(), stdin.clone());
 
-        let config = PowdrConfig::new(GUEST_KECCAK_APC_PGO, GUEST_KECCAK_SKIP);
+        let config = default_powdr_openvm_config(GUEST_KECCAK_APC_PGO, GUEST_KECCAK_SKIP);
         prove_recursion(
             GUEST_KECCAK,
             config,
+            PrecompileImplementation::SingleRowChip,
             stdin,
             PgoConfig::Instruction(pgo_data),
             None,
@@ -856,8 +1032,15 @@ mod tests {
         let mut stdin = StdIn::default();
         stdin.write(&GUEST_KECCAK_ITER_SMALL);
 
-        let config = PowdrConfig::new(GUEST_KECCAK_APC, GUEST_KECCAK_SKIP);
-        prove_mock(GUEST_KECCAK, config, stdin, PgoConfig::None, None);
+        let config = default_powdr_openvm_config(GUEST_KECCAK_APC, GUEST_KECCAK_SKIP);
+        prove_mock(
+            GUEST_KECCAK,
+            config,
+            PrecompileImplementation::SingleRowChip,
+            stdin,
+            PgoConfig::None,
+            None,
+        );
     }
 
     // All gate constraints should be satisfied, but bus interactions are not implemented yet.
@@ -865,9 +1048,15 @@ mod tests {
     fn keccak_plonk_small_prove_mock() {
         let mut stdin = StdIn::default();
         stdin.write(&GUEST_KECCAK_ITER_SMALL);
-        let config = PowdrConfig::new(GUEST_KECCAK_APC, GUEST_KECCAK_SKIP)
-            .with_precompile_implementation(PrecompileImplementation::PlonkChip);
-        prove_mock(GUEST_KECCAK, config, stdin, PgoConfig::None, None);
+        let config = default_powdr_openvm_config(GUEST_KECCAK_APC, GUEST_KECCAK_SKIP);
+        prove_mock(
+            GUEST_KECCAK,
+            config,
+            PrecompileImplementation::PlonkChip,
+            stdin,
+            PgoConfig::None,
+            None,
+        );
     }
 
     #[test]
@@ -875,8 +1064,15 @@ mod tests {
     fn keccak_prove_mock() {
         let mut stdin = StdIn::default();
         stdin.write(&GUEST_KECCAK_ITER);
-        let config = PowdrConfig::new(GUEST_KECCAK_APC, GUEST_KECCAK_SKIP);
-        prove_mock(GUEST_KECCAK, config, stdin, PgoConfig::None, None);
+        let config = default_powdr_openvm_config(GUEST_KECCAK_APC, GUEST_KECCAK_SKIP);
+        prove_mock(
+            GUEST_KECCAK,
+            config,
+            PrecompileImplementation::SingleRowChip,
+            stdin,
+            PgoConfig::None,
+            None,
+        );
     }
 
     // Create multiple APC for 10 Keccak iterations to test different PGO modes
@@ -886,34 +1082,204 @@ mod tests {
         // Config
         let mut stdin = StdIn::default();
         stdin.write(&GUEST_KECCAK_ITER_SMALL);
-        let config = PowdrConfig::new(GUEST_KECCAK_APC_PGO, GUEST_KECCAK_SKIP);
+        let config = default_powdr_openvm_config(GUEST_KECCAK_APC_PGO, GUEST_KECCAK_SKIP);
 
         // Pgo data
-        let pgo_data = get_pc_idx_count(GUEST_KECCAK, GuestOptions::default(), stdin.clone());
+        let pgo_data =
+            execution_profile_from_guest(GUEST_KECCAK, GuestOptions::default(), stdin.clone());
 
         // Pgo Cell mode
         let start = Instant::now();
         prove_simple(
             GUEST_KECCAK,
             config.clone(),
+            PrecompileImplementation::SingleRowChip,
             stdin.clone(),
-            PgoConfig::Cell(pgo_data.clone()),
+            PgoConfig::Cell(pgo_data.clone(), None),
             None,
         );
         let elapsed = start.elapsed();
-        tracing::debug!("Proving with PgoConfig::Instruction took {:?}", elapsed);
+        tracing::debug!("Proving keccak with PgoConfig::Cell took {:?}", elapsed);
 
         // Pgo Instruction mode
         let start = Instant::now();
         prove_simple(
             GUEST_KECCAK,
             config.clone(),
+            PrecompileImplementation::SingleRowChip,
             stdin.clone(),
             PgoConfig::Instruction(pgo_data),
             None,
         );
         let elapsed = start.elapsed();
-        tracing::debug!("Proving with PgoConfig::Cell took {:?}", elapsed);
+        tracing::debug!(
+            "Proving keccak with PgoConfig::Instruction took {:?}",
+            elapsed
+        );
+    }
+
+    #[test]
+    #[ignore = "Too long"]
+    fn sha256_prove_simple() {
+        let mut stdin = StdIn::default();
+        stdin.write(&GUEST_SHA256_ITER);
+        let config = default_powdr_openvm_config(GUEST_SHA256_APC_PGO, GUEST_SHA256_SKIP);
+
+        let pgo_data =
+            execution_profile_from_guest(GUEST_SHA256, GuestOptions::default(), stdin.clone());
+
+        prove_simple(
+            GUEST_SHA256,
+            config,
+            PrecompileImplementation::SingleRowChip,
+            stdin,
+            PgoConfig::Instruction(pgo_data),
+            None,
+        );
+    }
+
+    #[test]
+    #[ignore = "Too long"]
+    fn sha256_prove_mock() {
+        let mut stdin = StdIn::default();
+        stdin.write(&GUEST_SHA256_ITER);
+        let config = default_powdr_openvm_config(GUEST_SHA256_APC_PGO, GUEST_SHA256_SKIP);
+
+        let pgo_data =
+            execution_profile_from_guest(GUEST_SHA256, GuestOptions::default(), stdin.clone());
+
+        prove_mock(
+            GUEST_SHA256,
+            config,
+            PrecompileImplementation::SingleRowChip,
+            stdin,
+            PgoConfig::Instruction(pgo_data),
+            None,
+        );
+    }
+
+    #[test]
+    #[ignore = "Too much RAM"]
+    fn sha256_prove_many_apcs() {
+        let mut stdin = StdIn::default();
+        stdin.write(&GUEST_SHA256_ITER);
+        let pgo_data =
+            execution_profile_from_guest(GUEST_SHA256, GuestOptions::default(), stdin.clone());
+
+        let config = default_powdr_openvm_config(GUEST_SHA256_APC_PGO_LARGE, GUEST_SHA256_SKIP);
+        prove_recursion(
+            GUEST_SHA256,
+            config.clone(),
+            PrecompileImplementation::SingleRowChip,
+            stdin.clone(),
+            PgoConfig::Instruction(pgo_data.clone()),
+            None,
+        );
+
+        prove_recursion(
+            GUEST_SHA256,
+            config.clone(),
+            PrecompileImplementation::SingleRowChip,
+            stdin,
+            PgoConfig::Cell(pgo_data, None),
+            None,
+        );
+    }
+
+    #[test]
+    #[ignore = "Too much RAM"]
+    fn sha256_prove_large() {
+        let mut stdin = StdIn::default();
+        stdin.write(&GUEST_SHA256_ITER_LARGE);
+        let pgo_data =
+            execution_profile_from_guest(GUEST_SHA256, GuestOptions::default(), stdin.clone());
+
+        let config = default_powdr_openvm_config(GUEST_SHA256_APC_PGO, GUEST_SHA256_SKIP);
+        prove_recursion(
+            GUEST_SHA256,
+            config,
+            PrecompileImplementation::SingleRowChip,
+            stdin,
+            PgoConfig::Instruction(pgo_data),
+            None,
+        );
+    }
+
+    #[test]
+    fn sha256_small_prove_simple() {
+        let mut stdin = StdIn::default();
+        stdin.write(&GUEST_SHA256_ITER_SMALL);
+        let config = default_powdr_openvm_config(GUEST_SHA256_APC_PGO, GUEST_SHA256_SKIP);
+
+        let pgo_data =
+            execution_profile_from_guest(GUEST_SHA256, GuestOptions::default(), stdin.clone());
+
+        prove_simple(
+            GUEST_SHA256,
+            config,
+            PrecompileImplementation::SingleRowChip,
+            stdin,
+            PgoConfig::Instruction(pgo_data),
+            None,
+        );
+    }
+
+    #[test]
+    fn sha256_small_prove_mock() {
+        let mut stdin = StdIn::default();
+        stdin.write(&GUEST_SHA256_ITER_SMALL);
+        let config = default_powdr_openvm_config(GUEST_SHA256_APC_PGO, GUEST_SHA256_SKIP);
+
+        let pgo_data =
+            execution_profile_from_guest(GUEST_SHA256, GuestOptions::default(), stdin.clone());
+
+        prove_mock(
+            GUEST_SHA256,
+            config,
+            PrecompileImplementation::SingleRowChip,
+            stdin,
+            PgoConfig::Instruction(pgo_data),
+            None,
+        );
+    }
+
+    #[test]
+    fn sha256_prove_multiple_pgo_modes() {
+        use std::time::Instant;
+
+        let mut stdin = StdIn::default();
+        stdin.write(&GUEST_SHA256_ITER_SMALL);
+        let config = default_powdr_openvm_config(GUEST_SHA256_APC_PGO, GUEST_SHA256_SKIP);
+
+        let pgo_data =
+            execution_profile_from_guest(GUEST_SHA256, GuestOptions::default(), stdin.clone());
+
+        let start = Instant::now();
+        prove_simple(
+            GUEST_SHA256,
+            config.clone(),
+            PrecompileImplementation::SingleRowChip,
+            stdin.clone(),
+            PgoConfig::Cell(pgo_data.clone(), None),
+            None,
+        );
+        let elapsed = start.elapsed();
+        tracing::debug!("Proving sha256 with PgoConfig::Cell took {:?}", elapsed);
+
+        let start = Instant::now();
+        prove_simple(
+            GUEST_SHA256,
+            config.clone(),
+            PrecompileImplementation::SingleRowChip,
+            stdin.clone(),
+            PgoConfig::Instruction(pgo_data),
+            None,
+        );
+        let elapsed = start.elapsed();
+        tracing::debug!(
+            "Proving sha256 with PgoConfig::Instruction took {:?}",
+            elapsed
+        );
     }
 
     // #[test]
@@ -927,63 +1293,363 @@ mod tests {
     // }
 
     // The following are compilation tests only
-    fn test_guest_machine(pgo_config: PgoConfig) {
-        let config = PowdrConfig::new(GUEST_APC, GUEST_SKIP_PGO);
-        let machines = compile_guest(GUEST, GuestOptions::default(), config, pgo_config)
-            .unwrap()
-            .powdr_airs_metrics();
-        assert_eq!(machines.len(), 1);
-        let m = &machines[0];
-        assert_eq!([m.width, m.constraints, m.bus_interactions], [49, 22, 31]);
+
+    struct MachineTestParams<'a> {
+        pgo_config: PgoConfig,
+        guest: &'a str,
+        guest_apc: u64,
+        guest_skip: u64,
+        expected_metrics: &'a MachineTestMetrics,
+        expected_columns_saved: Option<AirWidthsDiff>, // only available in Pgo::Cell
     }
 
-    fn test_keccak_machine(pgo_config: PgoConfig) {
-        let config = PowdrConfig::new(GUEST_KECCAK_APC, GUEST_KECCAK_SKIP);
-        let machines = compile_guest(GUEST_KECCAK, GuestOptions::default(), config, pgo_config)
+    struct MachineTestMetrics {
+        powdr_expected_sum: AirMetrics,
+        powdr_expected_machine_count: usize,
+        non_powdr_expected_sum: AirMetrics,
+        non_powdr_expected_machine_count: usize,
+    }
+
+    fn test_machine_compilation(params: MachineTestParams) {
+        let apc_candidates_dir = tempfile::tempdir().unwrap();
+        let apc_candidates_dir_path = apc_candidates_dir.path();
+        let config = default_powdr_openvm_config(params.guest_apc, params.guest_skip)
+            .with_apc_candidates_dir(apc_candidates_dir_path);
+        let is_cell_pgo = matches!(params.pgo_config, PgoConfig::Cell(_, _));
+        let compiled_program = compile_guest(
+            params.guest,
+            GuestOptions::default(),
+            config,
+            PrecompileImplementation::SingleRowChip,
+            params.pgo_config,
+        )
+        .unwrap();
+
+        let MachineTestMetrics {
+            powdr_expected_sum,
+            powdr_expected_machine_count,
+            non_powdr_expected_sum,
+            non_powdr_expected_machine_count,
+        } = params.expected_metrics;
+
+        let (powdr_air_metrics, non_powdr_air_metrics) = compiled_program.air_metrics();
+        let powdr_machine_count = powdr_air_metrics.len();
+        let non_powdr_machine_count = non_powdr_air_metrics.len();
+        let powdr_sum = powdr_air_metrics
+            .iter()
+            .map(|(metrics, _)| metrics.clone())
+            .sum::<AirMetrics>();
+        let non_powdr_sum = non_powdr_air_metrics.into_iter().sum::<AirMetrics>();
+
+        assert_eq!(powdr_machine_count, *powdr_expected_machine_count);
+        assert_eq!(non_powdr_machine_count, *non_powdr_expected_machine_count);
+        assert_eq!(powdr_sum, *powdr_expected_sum);
+        assert_eq!(non_powdr_sum, *non_powdr_expected_sum);
+
+        // Test cells saved in Pgo::Cell
+        if is_cell_pgo {
+            let columns_saved = powdr_air_metrics
+                .into_iter()
+                .map(|(_, columns_saved)| columns_saved.unwrap())
+                .sum::<AirWidthsDiff>();
+            assert_eq!(columns_saved, params.expected_columns_saved.unwrap());
+        }
+
+        // In Cell PGO, check that the apc candidates were persisted to disk
+        let json_files_count = std::fs::read_dir(apc_candidates_dir_path)
             .unwrap()
-            .powdr_airs_metrics();
-        assert_eq!(machines.len(), 1);
-        let m = &machines[0];
-        assert_eq!(
-            [m.width, m.constraints, m.bus_interactions],
-            [2011, 166, 1783]
-        );
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+            .count();
+        let cbor_files_count = std::fs::read_dir(apc_candidates_dir_path)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "cbor"))
+            .count();
+        assert!(cbor_files_count > 0, "No APC candidate files found");
+        if is_cell_pgo {
+            assert_eq!(
+                json_files_count, 1,
+                "Expected exactly one APC candidate JSON file"
+            );
+        } else {
+            assert_eq!(
+                json_files_count, 0,
+                "Unexpected APC candidate JSON files found"
+            );
+        }
+    }
+
+    const NON_POWDR_EXPECTED_MACHINE_COUNT: usize = 18;
+    const NON_POWDR_EXPECTED_SUM: AirMetrics = AirMetrics {
+        widths: AirWidths {
+            preprocessed: 5,
+            main: 797,
+            log_up: 388,
+        },
+        constraints: 604,
+        bus_interactions: 252,
+    };
+
+    #[test]
+    fn guest_machine_pgo_modes() {
+        let mut stdin = StdIn::default();
+        stdin.write(&GUEST_ITER);
+        let pgo_data = execution_profile_from_guest(GUEST, GuestOptions::default(), stdin);
+
+        let expected_metrics = MachineTestMetrics {
+            powdr_expected_sum: AirMetrics {
+                widths: AirWidths {
+                    preprocessed: 0,
+                    main: 49,
+                    log_up: 36,
+                },
+                constraints: 22,
+                bus_interactions: 31,
+            },
+            powdr_expected_machine_count: 1,
+            non_powdr_expected_sum: NON_POWDR_EXPECTED_SUM,
+            non_powdr_expected_machine_count: NON_POWDR_EXPECTED_MACHINE_COUNT,
+        };
+
+        test_machine_compilation(MachineTestParams {
+            pgo_config: PgoConfig::Instruction(pgo_data.clone()),
+            guest: GUEST,
+            guest_apc: GUEST_APC,
+            guest_skip: GUEST_SKIP_PGO,
+            expected_metrics: &expected_metrics,
+            expected_columns_saved: None, // not tested in instruction mode
+        });
+
+        test_machine_compilation(MachineTestParams {
+            pgo_config: PgoConfig::Cell(pgo_data, None),
+            guest: GUEST,
+            guest_apc: GUEST_APC,
+            guest_skip: GUEST_SKIP_PGO,
+            expected_metrics: &expected_metrics,
+            expected_columns_saved: Some(AirWidthsDiff {
+                before: AirWidths {
+                    preprocessed: 0,
+                    main: 170,
+                    log_up: 128,
+                },
+                after: AirWidths {
+                    preprocessed: 0,
+                    main: 49,
+                    log_up: 36,
+                },
+            }),
+        });
     }
 
     #[test]
-    fn guest_machine_pgo() {
+    fn sha256_machine_pgo() {
         let mut stdin = StdIn::default();
-        stdin.write(&GUEST_ITER);
-        let pgo_data = get_pc_idx_count(GUEST, GuestOptions::default(), stdin);
-        test_guest_machine(PgoConfig::Instruction(pgo_data.clone()));
-        test_guest_machine(PgoConfig::Cell(pgo_data));
+        stdin.write(&GUEST_SHA256_ITER_SMALL);
+        let pgo_data = execution_profile_from_guest(GUEST_SHA256, GuestOptions::default(), stdin);
+
+        let expected_metrics_instruction = MachineTestMetrics {
+            powdr_expected_sum: AirMetrics {
+                widths: AirWidths {
+                    preprocessed: 0,
+                    main: 14695,
+                    log_up: 12144,
+                },
+                constraints: 4143,
+                bus_interactions: 11692,
+            },
+            powdr_expected_machine_count: 10,
+            non_powdr_expected_sum: NON_POWDR_EXPECTED_SUM,
+            non_powdr_expected_machine_count: NON_POWDR_EXPECTED_MACHINE_COUNT,
+        };
+
+        test_machine_compilation(MachineTestParams {
+            pgo_config: PgoConfig::Instruction(pgo_data.clone()),
+            guest: GUEST_SHA256,
+            guest_apc: GUEST_SHA256_APC_PGO,
+            guest_skip: GUEST_SHA256_SKIP,
+            expected_metrics: &expected_metrics_instruction,
+            expected_columns_saved: None, // not tested in instruction mode
+        });
+
+        let expected_metrics_cell = MachineTestMetrics {
+            powdr_expected_sum: AirMetrics {
+                widths: AirWidths {
+                    preprocessed: 0,
+                    main: 14675,
+                    log_up: 12124,
+                },
+                constraints: 4127,
+                bus_interactions: 11682,
+            },
+            powdr_expected_machine_count: 10,
+            non_powdr_expected_sum: NON_POWDR_EXPECTED_SUM,
+            non_powdr_expected_machine_count: NON_POWDR_EXPECTED_MACHINE_COUNT,
+        };
+
+        test_machine_compilation(MachineTestParams {
+            pgo_config: PgoConfig::Cell(pgo_data, None),
+            guest: GUEST_SHA256,
+            guest_apc: GUEST_SHA256_APC_PGO,
+            guest_skip: GUEST_SHA256_SKIP,
+            expected_metrics: &expected_metrics_cell,
+            expected_columns_saved: Some(AirWidthsDiff {
+                before: AirWidths {
+                    preprocessed: 0,
+                    main: 176212,
+                    log_up: 117468,
+                },
+                after: AirWidths {
+                    preprocessed: 0,
+                    main: 14675,
+                    log_up: 12124,
+                },
+            }),
+        });
     }
 
     #[test]
     fn guest_machine_plonk() {
-        let config = PowdrConfig::new(GUEST_APC, GUEST_SKIP)
-            .with_precompile_implementation(PrecompileImplementation::PlonkChip);
-        let machines = compile_guest(GUEST, GuestOptions::default(), config, PgoConfig::None)
-            .unwrap()
-            .powdr_airs_metrics();
-        assert_eq!(machines.len(), 1);
-        let m = &machines[0];
-        assert_eq!(m.width, 16);
-        assert_eq!(m.constraints, 1);
-        assert_eq!(m.bus_interactions, 6);
+        let config = default_powdr_openvm_config(GUEST_APC, GUEST_SKIP);
+        let (powdr_metrics, _) = compile_guest(
+            GUEST,
+            GuestOptions::default(),
+            config,
+            PrecompileImplementation::PlonkChip,
+            PgoConfig::None,
+        )
+        .unwrap()
+        .air_metrics();
+        assert_eq!(powdr_metrics.len(), 1);
+        let powdr_metrics_sum = powdr_metrics
+            .into_iter()
+            .map(|(metrics, _)| metrics)
+            .sum::<AirMetrics>();
+        assert_eq!(
+            powdr_metrics_sum,
+            AirMetrics {
+                widths: AirWidths {
+                    preprocessed: 0,
+                    main: 26,
+                    log_up: 20,
+                },
+                constraints: 1,
+                bus_interactions: 16,
+            }
+        );
     }
 
     #[test]
-    fn keccak_machine() {
-        test_keccak_machine(PgoConfig::None);
-    }
-
-    #[test]
-    fn keccak_machine_pgo() {
+    fn keccak_machine_pgo_modes() {
         let mut stdin = StdIn::default();
         stdin.write(&GUEST_KECCAK_ITER_SMALL);
-        let pgo_data = get_pc_idx_count(GUEST_KECCAK, GuestOptions::default(), stdin);
-        test_keccak_machine(PgoConfig::Instruction(pgo_data.clone()));
-        test_keccak_machine(PgoConfig::Cell(pgo_data));
+        let pgo_data = execution_profile_from_guest(GUEST_KECCAK, GuestOptions::default(), stdin);
+
+        // All three modes happen to create 1 APC for the same basic block
+        let expected_metrics = MachineTestMetrics {
+            powdr_expected_sum: AirMetrics {
+                widths: AirWidths {
+                    preprocessed: 0,
+                    main: 2011,
+                    log_up: 1788,
+                },
+                constraints: 166,
+                bus_interactions: 1783,
+            },
+            powdr_expected_machine_count: 1,
+            non_powdr_expected_sum: NON_POWDR_EXPECTED_SUM,
+            non_powdr_expected_machine_count: NON_POWDR_EXPECTED_MACHINE_COUNT,
+        };
+
+        test_machine_compilation(MachineTestParams {
+            pgo_config: PgoConfig::None,
+            guest: GUEST_KECCAK,
+            guest_apc: GUEST_KECCAK_APC,
+            guest_skip: GUEST_KECCAK_SKIP,
+            expected_metrics: &expected_metrics,
+            expected_columns_saved: None, // not tested in none mode
+        });
+
+        test_machine_compilation(MachineTestParams {
+            pgo_config: PgoConfig::Instruction(pgo_data.clone()),
+            guest: GUEST_KECCAK,
+            guest_apc: GUEST_KECCAK_APC,
+            guest_skip: GUEST_KECCAK_SKIP,
+            expected_metrics: &expected_metrics,
+            expected_columns_saved: None, // not tested in instruction mode
+        });
+
+        test_machine_compilation(MachineTestParams {
+            pgo_config: PgoConfig::Cell(pgo_data, None),
+            guest: GUEST_KECCAK,
+            guest_apc: GUEST_KECCAK_APC,
+            guest_skip: GUEST_KECCAK_SKIP,
+            expected_metrics: &expected_metrics,
+            expected_columns_saved: Some(AirWidthsDiff {
+                before: AirWidths {
+                    preprocessed: 0,
+                    main: 27194,
+                    log_up: 18736,
+                },
+                after: AirWidths {
+                    preprocessed: 0,
+                    main: 2011,
+                    log_up: 1788,
+                },
+            }),
+        });
+    }
+
+    #[test]
+    fn keccak_machine_cell_pgo_max_columns() {
+        const MAX_TOTAL_COLUMNS: usize = 10_000;
+
+        let mut stdin = StdIn::default();
+        stdin.write(&GUEST_KECCAK_ITER_SMALL);
+        let pgo_data =
+            execution_profile_from_guest(GUEST_KECCAK, GuestOptions::default(), stdin.clone());
+        let powdr_metrics_sum = AirMetrics {
+            widths: AirWidths {
+                preprocessed: 0,
+                main: 4824,
+                log_up: 3968,
+            },
+            constraints: 935,
+            bus_interactions: 3826,
+        };
+
+        let expected_metrics = MachineTestMetrics {
+            powdr_expected_sum: powdr_metrics_sum.clone(),
+            powdr_expected_machine_count: 18,
+            non_powdr_expected_sum: NON_POWDR_EXPECTED_SUM,
+            non_powdr_expected_machine_count: NON_POWDR_EXPECTED_MACHINE_COUNT,
+        };
+
+        test_machine_compilation(MachineTestParams {
+            pgo_config: PgoConfig::Cell(pgo_data, Some(MAX_TOTAL_COLUMNS)),
+            guest: GUEST_KECCAK,
+            guest_apc: GUEST_KECCAK_APC_PGO_LARGE,
+            guest_skip: GUEST_KECCAK_SKIP,
+            expected_metrics: &expected_metrics,
+            expected_columns_saved: Some(AirWidthsDiff {
+                before: AirWidths {
+                    preprocessed: 0,
+                    main: 38846,
+                    log_up: 26832,
+                },
+                after: AirWidths {
+                    preprocessed: 0,
+                    main: 4824,
+                    log_up: 3968,
+                },
+            }),
+        });
+
+        // Assert that total columns don't exceed the initial limit set
+        let total_columns = (powdr_metrics_sum + NON_POWDR_EXPECTED_SUM).widths.total();
+        assert!(
+            total_columns <= MAX_TOTAL_COLUMNS,
+            "Total columns exceeded the limit: {total_columns} > {MAX_TOTAL_COLUMNS}"
+        );
     }
 }

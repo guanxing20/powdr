@@ -1,9 +1,9 @@
 //! Builds SymbolicInstructionStatement to create input program for testing powdr_autoprecompile::build
 use crate::opcode::*;
-use powdr_autoprecompiles::SymbolicInstructionStatement;
-use powdr_number::FieldElement;
+use openvm_instructions::{instruction::Instruction, VmOpcode};
+use openvm_stark_backend::p3_field::PrimeField32;
 
-// Unified builder for all 5-argument instructions (padded to 7 args)
+// Generic instructions (5 args, fixed f=0, g=0)
 macro_rules! build_instr5 {
     (
         $(
@@ -13,31 +13,29 @@ macro_rules! build_instr5 {
     ) => {
         $(
             $(#[$doc])*
-            pub fn $name<T: FieldElement>(
+            pub fn $name<T: PrimeField32>(
                 a: u32,
                 b: u32,
                 c: u32,
                 d: u32,
                 e: u32,
-            ) -> SymbolicInstructionStatement<T> {
-                SymbolicInstructionStatement {
-                    opcode: $code as usize,
-                    args: vec![
-                        T::from(a),
-                        T::from(b),
-                        T::from(c),
-                        T::from(d),
-                        T::from(e),
-                        T::zero(),
-                        T::zero(),
-                    ],
+            ) -> Instruction<T> {
+                Instruction {
+                    opcode: VmOpcode::from_usize($code as usize),
+                    a: T::from_canonical_u32(a),
+                    b: T::from_canonical_u32(b),
+                    c: T::from_canonical_u32(c),
+                    d: T::from_canonical_u32(d),
+                    e: T::from_canonical_u32(e),
+                    f: T::ZERO,
+                    g: T::ZERO,
                 }
             }
         )+
     };
 }
 
-// ALU instructions (7 args, fixed d=1, f=0, g=0)
+// ALU instructions (4 args, fixed d=1, f=0, g=0)
 macro_rules! alu_ops {
     (
         $(
@@ -47,30 +45,28 @@ macro_rules! alu_ops {
     ) => {
         $(
             $(#[$doc])*
-            pub fn $name<T: FieldElement>(
+            pub fn $name<T: PrimeField32>(
                 rd_ptr: u32,
                 rs1_ptr: u32,
                 rs2: u32,
                 rs2_as: u32,
-            ) -> SymbolicInstructionStatement<T> {
-                SymbolicInstructionStatement {
-                    opcode: $code as usize,
-                    args: vec![
-                        T::from(rd_ptr),
-                        T::from(rs1_ptr),
-                        T::from(rs2),
-                        T::one(),
-                        T::from(rs2_as),
-                        T::zero(),
-                        T::zero(),
-                    ],
+            ) -> Instruction<T> {
+                Instruction {
+                    opcode: VmOpcode::from_usize($code as usize),
+                    a: T::from_canonical_u32(rd_ptr),
+                    b: T::from_canonical_u32(rs1_ptr),
+                    c: T::from_canonical_u32(rs2),
+                    d: T::ONE,
+                    e: T::from_canonical_u32(rs2_as),
+                    f: T::ZERO,
+                    g: T::ZERO,
                 }
             }
         )+
     };
 }
 
-// Load/Store (7 args, fixed d=1)
+// Load/Store and Load/Store Sign Extend instructions (6 args, fixed d=1)
 macro_rules! ls_ops {
     (
         $(
@@ -80,53 +76,61 @@ macro_rules! ls_ops {
     ) => {
         $(
             $(#[$doc])*
-            pub fn $name<T: FieldElement>(
+            pub fn $name<T: PrimeField32>(
                 rd_rs2_ptr: u32,
                 rs1_ptr: u32,
                 imm: u32,
                 mem_as: u32,
                 needs_write: u32,
                 imm_sign: u32,
-            ) -> SymbolicInstructionStatement<T> {
-                SymbolicInstructionStatement {
-                    opcode: $code as usize,
-                    args: vec![
-                        T::from(rd_rs2_ptr),
-                        T::from(rs1_ptr),
-                        T::from(imm),
-                        T::one(),
-                        T::from(mem_as),
-                        T::from(needs_write),
-                        T::from(imm_sign),
-                    ],
+            ) -> Instruction<T> {
+                Instruction {
+                    opcode: VmOpcode::from_usize($code as usize),
+                    a: T::from_canonical_u32(rd_rs2_ptr),
+                    b: T::from_canonical_u32(rs1_ptr),
+                    c: T::from_canonical_u32(imm),
+                    d: T::ONE,
+                    e: T::from_canonical_u32(mem_as),
+                    f: T::from_canonical_u32(needs_write),
+                    g: T::from_canonical_u32(imm_sign),
                 }
             }
         )+
     };
 }
 
-// 5-arg instructions
+// Branch Lt and Branch Eq instructions (3 args, fixed d=1, e=1, f=0, g=0)
+macro_rules! branch_ops {
+    (
+        $(
+            $(#[$doc:meta])*
+            ($name:ident, $code:expr)
+        ),+ $(,)?
+    ) => {
+        $(
+            $(#[$doc])*
+            pub fn $name<T: PrimeField32>(
+                rs1_ptr: u32,
+                rs2_ptr: u32,
+                imm: i32,
+            ) -> Instruction<T> {
+                Instruction {
+                    opcode: VmOpcode::from_usize($code as usize),
+                    a: T::from_canonical_u32(rs1_ptr),
+                    b: T::from_canonical_u32(rs2_ptr),
+                    c: T::from_canonical_u32(imm as u32),
+                    d: T::ONE,
+                    e: T::ONE,
+                    f: T::ZERO,
+                    g: T::ZERO,
+                }
+            }
+        )+
+    };
+}
+
+// Generic instructions
 build_instr5!(
-    /// Branch equal (Branch adapter and Branch Eq core):
-    /// - to_pc = pc + imm if load(REG, rs1_ptr) == load(REG, rs2_ptr) else pc + 4
-    (beq, OPCODE_BEQ),
-    /// Branch not equal (Branch adapter and Branch Eq core):
-    /// - to_pc = pc + imm if load(REG, rs1_ptr) != load(REG, rs2_ptr) else pc + 4
-    (bne, OPCODE_BNE),
-
-    /// Branch less than signed (Branch adapter and Branch Lt core):
-    /// - to_pc = pc + imm if load(REG, rs1_ptr) < load(REG, rs2_ptr) else pc + 4
-    (blt, OPCODE_BLT),
-    /// Branch less than unsigned (Branch adapter and Branch Lt core):
-    /// - to_pc = pc + imm if load(REG, rs1_ptr) < load(REG, rs2_ptr) else pc + 4
-    (bltu, OPCODE_BLTU),
-    /// Branch greater than or equal signed (Branch adapter and Branch Lt core):
-    /// - to_pc = pc + imm if load(REG, rs1_ptr) >= load(REG, rs2_ptr) else pc + 4
-    (bge, OPCODE_BGE),
-    /// Branch greater than or equal unsigned (Branch adapter and Branch Lt core):
-    /// - to_pc = pc + imm if load(REG, rs1_ptr) >= load(REG, rs2_ptr) else pc + 4
-    (bgeu, OPCODE_BGEU),
-
     /// Jump and link (Rdwrite adapter and JAL_LUI core):
     /// - to_pc = pc + imm
     /// - store(REG, rd_ptr, pc + 4)
@@ -177,7 +181,7 @@ build_instr5!(
     (hint_buffer, OPCODE_HINT_BUFFER)
 );
 
-// Use macros to define ALU and LS ops
+// ALU instructions
 alu_ops!(
     /// Addition (ALU adapter and ALU core):
     /// - store(REG, rd_ptr, load(REG, rs1_ptr) + load(rs2_as, rs2))
@@ -213,6 +217,7 @@ alu_ops!(
     (sltu, OPCODE_SLTU)
 );
 
+// Load/Store and Load/Store Sign Extend instructions
 ls_ops!(
     /// Load word (Load/store adapter and Load sign extend core):
     /// - store(REG, rd_ptr, load(mem_as, val(rs1) + imm)), where val(rs1) = load(REG, rs1_ptr)
@@ -240,4 +245,27 @@ ls_ops!(
     /// Load half-word signed (Load/store adapter and Load sign extend core):
     /// - store(REG, rd_ptr, load_half_word_signed(mem_as, val(rs1) + imm)), where val(rs1) = load(REG, rs1_ptr)
     (loadh, OPCODE_LOADH)
+);
+
+// Branch Eq and Branch Lt instructions
+branch_ops!(
+    /// Branch equal (Branch adapter and Branch Eq core):
+    /// - to_pc = pc + imm if load(REG, rs1_ptr) == load(REG, rs2_ptr) else pc + 4
+    (beq, OPCODE_BEQ),
+    /// Branch not equal (Branch adapter and Branch Eq core):
+    /// - to_pc = pc + imm if load(REG, rs1_ptr) != load(REG, rs2_ptr) else pc + 4
+    (bne, OPCODE_BNE),
+
+    /// Branch less than signed (Branch adapter and Branch Lt core):
+    /// - to_pc = pc + imm if load(REG, rs1_ptr) < load(REG, rs2_ptr) else pc + 4
+    (blt, OPCODE_BLT),
+    /// Branch less than unsigned (Branch adapter and Branch Lt core):
+    /// - to_pc = pc + imm if load(REG, rs1_ptr) < load(REG, rs2_ptr) else pc + 4
+    (bltu, OPCODE_BLTU),
+    /// Branch greater than or equal signed (Branch adapter and Branch Lt core):
+    /// - to_pc = pc + imm if load(REG, rs1_ptr) >= load(REG, rs2_ptr) else pc + 4
+    (bge, OPCODE_BGE),
+    /// Branch greater than or equal unsigned (Branch adapter and Branch Lt core):
+    /// - to_pc = pc + imm if load(REG, rs1_ptr) >= load(REG, rs2_ptr) else pc + 4
+    (bgeu, OPCODE_BGEU),
 );

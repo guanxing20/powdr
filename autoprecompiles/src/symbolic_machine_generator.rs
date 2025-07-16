@@ -1,32 +1,118 @@
-use std::collections::BTreeMap;
-
-use super::simplify_expression;
 use itertools::Itertools;
+use powdr_expression::AlgebraicBinaryOperation;
 use powdr_number::FieldElement;
 
 use crate::{
-    expression::{AlgebraicExpression, AlgebraicReference},
-    powdr, BusMap, BusType, PcLookupBusInteraction, SymbolicBusInteraction, SymbolicConstraint,
+    adapter::Adapter, blocks::Instruction, expression::AlgebraicExpression, powdr, BusMap, BusType,
+    InstructionMachineHandler, PcLookupBusInteraction, SymbolicBusInteraction, SymbolicConstraint,
     SymbolicInstructionStatement, SymbolicMachine,
 };
 
-pub fn statements_to_symbolic_machine<T: FieldElement>(
-    statements: &[SymbolicInstructionStatement<T>],
-    instruction_machines: &BTreeMap<usize, SymbolicMachine<T>>,
+pub fn convert_machine<T, U>(
+    machine: SymbolicMachine<T>,
+    convert: &impl Fn(T) -> U,
+) -> SymbolicMachine<U> {
+    SymbolicMachine {
+        constraints: machine
+            .constraints
+            .into_iter()
+            .map(|c| convert_symbolic_constraint(c, convert))
+            .collect(),
+        bus_interactions: machine
+            .bus_interactions
+            .into_iter()
+            .map(|i| convert_bus_interaction(i, convert))
+            .collect(),
+    }
+}
+
+fn convert_symbolic_constraint<T, U>(
+    constraint: SymbolicConstraint<T>,
+    convert: &impl Fn(T) -> U,
+) -> SymbolicConstraint<U> {
+    SymbolicConstraint {
+        expr: convert_expression(constraint.expr, convert),
+    }
+}
+
+fn convert_bus_interaction<T, U>(
+    constraint: SymbolicBusInteraction<T>,
+    convert: &impl Fn(T) -> U,
+) -> SymbolicBusInteraction<U> {
+    SymbolicBusInteraction {
+        id: constraint.id,
+        mult: convert_expression(constraint.mult, convert),
+        args: constraint
+            .args
+            .into_iter()
+            .map(|e| convert_expression(e, convert))
+            .collect(),
+    }
+}
+
+fn convert_expression<T, U>(
+    expr: AlgebraicExpression<T>,
+    convert: &impl Fn(T) -> U,
+) -> AlgebraicExpression<U> {
+    match expr {
+        AlgebraicExpression::Number(n) => AlgebraicExpression::Number(convert(n)),
+        AlgebraicExpression::Reference(r) => AlgebraicExpression::Reference(r),
+        AlgebraicExpression::BinaryOperation(algebraic_binary_operation) => {
+            AlgebraicExpression::BinaryOperation(AlgebraicBinaryOperation {
+                op: algebraic_binary_operation.op,
+                left: Box::new(convert_expression(
+                    *algebraic_binary_operation.left,
+                    convert,
+                )),
+                right: Box::new(convert_expression(
+                    *algebraic_binary_operation.right,
+                    convert,
+                )),
+            })
+        }
+        AlgebraicExpression::UnaryOperation(algebraic_unary_operation) => {
+            AlgebraicExpression::UnaryOperation(powdr_expression::AlgebraicUnaryOperation {
+                op: algebraic_unary_operation.op,
+                expr: Box::new(convert_expression(*algebraic_unary_operation.expr, convert)),
+            })
+        }
+    }
+}
+
+pub fn statements_to_symbolic_machine<A: Adapter>(
+    statements: &[A::Instruction],
+    instruction_machine_handler: &A::InstructionMachineHandler,
     bus_map: &BusMap,
-) -> (SymbolicMachine<T>, Vec<Vec<u64>>) {
-    let mut constraints: Vec<SymbolicConstraint<T>> = Vec::new();
-    let mut bus_interactions: Vec<SymbolicBusInteraction<T>> = Vec::new();
+) -> (SymbolicMachine<A::PowdrField>, Vec<Vec<u64>>) {
+    let mut constraints: Vec<SymbolicConstraint<_>> = Vec::new();
+    let mut bus_interactions: Vec<SymbolicBusInteraction<_>> = Vec::new();
     let mut col_subs: Vec<Vec<u64>> = Vec::new();
     let mut global_idx: u64 = 3;
 
     for (i, instr) in statements.iter().enumerate() {
-        let machine = instruction_machines.get(&instr.opcode).unwrap().clone();
+        let machine = instruction_machine_handler
+            .get_instruction_air(instr)
+            .unwrap()
+            .clone();
 
-        let (next_global_idx, subs, machine) = powdr::reassign_ids(machine, global_idx, i);
+        let machine: SymbolicMachine<<A as Adapter>::PowdrField> =
+            convert_machine(machine, &|x| A::from_field(x));
+
+        let instr = instr.clone().into_symbolic_instruction();
+
+        let instr = SymbolicInstructionStatement {
+            opcode: instr.opcode,
+            args: instr
+                .args
+                .iter()
+                .map(|a| A::from_field(a.clone()))
+                .collect(),
+        };
+
+        let (next_global_idx, subs, machine) = powdr::globalize_references(machine, global_idx, i);
         global_idx = next_global_idx;
 
-        let pc_lookup: PcLookupBusInteraction<T> = machine
+        let pc_lookup: PcLookupBusInteraction<_> = machine
             .bus_interactions
             .iter()
             .filter_map(|bus_int| {
@@ -39,17 +125,19 @@ pub fn statements_to_symbolic_machine<T: FieldElement>(
             .exactly_one()
             .expect("Expected single pc lookup");
 
-        let mut sub_map: BTreeMap<AlgebraicReference, AlgebraicExpression<T>> = Default::default();
-        let mut local_constraints: Vec<SymbolicConstraint<T>> = Vec::new();
+        let mut local_constraints: Vec<SymbolicConstraint<_>> = Vec::new();
 
-        let is_valid: AlgebraicExpression<T> = exec_receive(
+        // To simplify constraint solving, we constrain `is_valid` to be 1, which effectively
+        // removes the column. The optimized precompile will then have to be guarded by a new
+        // `is_valid` column.
+        let minus_is_valid: AlgebraicExpression<_> = exec_receive(
             &machine,
             bus_map.get_bus_id(&BusType::ExecutionBridge).unwrap(),
         )
         .mult
         .clone();
         let one = AlgebraicExpression::Number(1u64.into());
-        local_constraints.push((is_valid.clone() + one).into());
+        local_constraints.push((minus_is_valid.clone() + one).into());
 
         // Constrain the opcode expression to equal the actual opcode.
         let opcode_constant = AlgebraicExpression::Number((instr.opcode as u64).into());
@@ -62,46 +150,19 @@ pub fn statements_to_symbolic_machine<T: FieldElement>(
             .zip_eq(&pc_lookup.args)
             .for_each(|(instr_arg, pc_arg)| {
                 let arg = AlgebraicExpression::Number(*instr_arg);
-                match pc_arg {
-                    AlgebraicExpression::Reference(arg_ref) => {
-                        sub_map.insert(arg_ref.clone(), arg);
-                    }
-                    AlgebraicExpression::BinaryOperation(_expr) => {
-                        local_constraints.push((arg - pc_arg.clone()).into());
-                    }
-                    AlgebraicExpression::UnaryOperation(_expr) => {
-                        local_constraints.push((arg - pc_arg.clone()).into());
-                    }
-                    _ => {}
-                }
+                local_constraints.push((arg - pc_arg.clone()).into());
             });
 
-        let local_identities = machine
-            .constraints
-            .iter()
-            .chain(&local_constraints)
-            .map(|expr| {
-                let mut expr = expr.expr.clone();
-                powdr::substitute_algebraic(&mut expr, &sub_map);
-                expr = simplify_expression(expr);
-                SymbolicConstraint { expr }
-            })
-            .collect::<Vec<_>>();
-
-        constraints.extend(local_identities);
-
-        for bus_int in &machine.bus_interactions {
-            let mut link = bus_int.clone();
-            link.args
-                .iter_mut()
-                .chain(std::iter::once(&mut link.mult))
-                .for_each(|e| {
-                    powdr::substitute_algebraic(e, &sub_map);
-                    *e = simplify_expression(e.clone());
-                });
-            bus_interactions.push(link);
-        }
-
+        constraints.extend(
+            machine
+                .constraints
+                .iter()
+                .chain(&local_constraints)
+                .map(|expr| SymbolicConstraint {
+                    expr: expr.expr.clone(),
+                }),
+        );
+        bus_interactions.extend(machine.bus_interactions.iter().cloned());
         col_subs.push(subs);
     }
 

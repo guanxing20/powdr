@@ -1,30 +1,26 @@
 use powdr_constraint_solver::{
-    quadratic_symbolic_expression::QuadraticSymbolicExpression,
-    symbolic_expression::{BinaryOperator, SymbolicExpression, UnaryOperator},
+    grouped_expression::GroupedExpression, runtime_constant::RuntimeConstant,
 };
-use powdr_expression::{
-    AlgebraicBinaryOperation, AlgebraicBinaryOperator, AlgebraicUnaryOperation,
-    AlgebraicUnaryOperator,
-};
-use powdr_number::FieldElement;
+use powdr_expression::{AlgebraicUnaryOperation, AlgebraicUnaryOperator};
+use powdr_number::{ExpressionConvertible, FieldElement};
 
 use crate::expression::{AlgebraicExpression, AlgebraicReference};
 
-/// Turns an algebraic expression into a quadratic symbolic expression,
+/// Turns an algebraic expression into a grouped expression,
 /// assuming all [`AlgebraicReference`]s are unknown variables.
-pub fn algebraic_to_quadratic_symbolic_expression<T: FieldElement>(
+pub fn algebraic_to_grouped_expression<T: FieldElement>(
     expr: &AlgebraicExpression<T>,
-) -> QuadraticSymbolicExpression<T, AlgebraicReference> {
-    powdr_expression::conversion::convert(expr, &mut |reference| {
-        QuadraticSymbolicExpression::from_unknown_variable(reference.clone())
+) -> GroupedExpression<T, AlgebraicReference> {
+    expr.to_expression(&|n| GroupedExpression::from_number(*n), &|reference| {
+        GroupedExpression::from_unknown_variable(reference.clone())
     })
 }
 
-/// Turns a quadratic symbolic expression back into an algebraic expression.
+/// Turns a grouped expression back into an algebraic expression.
 /// Tries to simplify the expression wrt negation and constant factors
 /// to aid human readability.
-pub fn quadratic_symbolic_expression_to_algebraic<T: FieldElement>(
-    expr: &QuadraticSymbolicExpression<T, AlgebraicReference>,
+pub fn grouped_expression_to_algebraic<T: FieldElement>(
+    expr: &GroupedExpression<T, AlgebraicReference>,
 ) -> AlgebraicExpression<T> {
     // Turn the expression into a list of to-be-summed items and try to
     // simplify on the way.
@@ -32,9 +28,9 @@ pub fn quadratic_symbolic_expression_to_algebraic<T: FieldElement>(
     let items = quadratic
         .iter()
         .map(|(l, r)| {
-            let l = quadratic_symbolic_expression_to_algebraic(l);
+            let l = grouped_expression_to_algebraic(l);
             let (l, l_negated) = extract_negation_if_possible(l);
-            let r = quadratic_symbolic_expression_to_algebraic(r);
+            let r = grouped_expression_to_algebraic(r);
             let (r, r_negated) = extract_negation_if_possible(r);
             if l_negated == r_negated {
                 l * r
@@ -43,21 +39,19 @@ pub fn quadratic_symbolic_expression_to_algebraic<T: FieldElement>(
             }
         })
         .chain(linear.map(|(v, c)| {
-            if let Some(c) = c.try_to_number() {
-                if c.is_one() {
-                    return AlgebraicExpression::Reference(v.clone());
-                } else if (-c).is_one() {
-                    return -AlgebraicExpression::Reference(v.clone());
-                }
-            }
-            let (c, negated) = extract_negation_if_possible(symbolic_expression_to_algebraic(c));
-            if negated {
-                -(c * AlgebraicExpression::Reference(v.clone()))
+            if c.is_one() {
+                AlgebraicExpression::Reference(v.clone())
+            } else if (-*c).is_one() {
+                -AlgebraicExpression::Reference(v.clone())
+            } else if c.is_in_lower_half() {
+                AlgebraicExpression::from(*c) * AlgebraicExpression::Reference(v.clone())
             } else {
-                c * AlgebraicExpression::Reference(v.clone())
+                -(AlgebraicExpression::from(-*c) * AlgebraicExpression::Reference(v.clone()))
             }
         }))
-        .chain((!constant.is_known_zero()).then(|| symbolic_expression_to_algebraic(constant)));
+        .chain(
+            (!constant.is_known_zero()).then(|| field_element_to_algebraic_expression(*constant)),
+        );
 
     // Now order the items by negated and non-negated.
     let mut positive = vec![];
@@ -80,39 +74,11 @@ pub fn quadratic_symbolic_expression_to_algebraic<T: FieldElement>(
     }
 }
 
-fn symbolic_expression_to_algebraic<T: FieldElement>(
-    e: &SymbolicExpression<T, AlgebraicReference>,
-) -> AlgebraicExpression<T> {
-    match e {
-        SymbolicExpression::Concrete(v) => {
-            if v.is_in_lower_half() {
-                AlgebraicExpression::from(*v)
-            } else {
-                -AlgebraicExpression::from(-*v)
-            }
-        }
-        SymbolicExpression::Symbol(r, _) => AlgebraicExpression::Reference(r.clone()),
-        SymbolicExpression::BinaryOperation(left, op, right, _) => {
-            let left = Box::new(symbolic_expression_to_algebraic(left));
-            let right = Box::new(symbolic_expression_to_algebraic(right));
-            let op = symbolic_op_to_algebraic(*op);
-            AlgebraicExpression::BinaryOperation(AlgebraicBinaryOperation { left, op, right })
-        }
-        SymbolicExpression::UnaryOperation(op, inner, _) => match op {
-            UnaryOperator::Neg => AlgebraicExpression::UnaryOperation(AlgebraicUnaryOperation {
-                expr: Box::new(symbolic_expression_to_algebraic(inner)),
-                op: AlgebraicUnaryOperator::Minus,
-            }),
-        },
-    }
-}
-
-fn symbolic_op_to_algebraic(op: BinaryOperator) -> AlgebraicBinaryOperator {
-    match op {
-        BinaryOperator::Add => AlgebraicBinaryOperator::Add,
-        BinaryOperator::Sub => AlgebraicBinaryOperator::Sub,
-        BinaryOperator::Mul => AlgebraicBinaryOperator::Mul,
-        BinaryOperator::Div => unreachable!(),
+fn field_element_to_algebraic_expression<T: FieldElement>(v: T) -> AlgebraicExpression<T> {
+    if v.is_in_lower_half() {
+        AlgebraicExpression::from(v)
+    } else {
+        -AlgebraicExpression::from(-v)
     }
 }
 

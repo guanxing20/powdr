@@ -1,24 +1,28 @@
+use crate::adapter::{Adapter, AdapterApc};
 use crate::bus_map::{BusMap, BusType};
-use crate::expression_conversion::algebraic_to_quadratic_symbolic_expression;
-use crate::optimizer::simplify_expression;
-use constraint_optimizer::IsBusStateful;
+use crate::expression_conversion::algebraic_to_grouped_expression;
+use crate::symbolic_machine_generator::convert_machine;
+pub use blocks::{BasicBlock, PgoConfig};
 use expression::{AlgebraicExpression, AlgebraicReference};
 use itertools::Itertools;
 use powdr::UniqueReferences;
-use powdr_constraint_solver::constraint_system::BusInteractionHandler;
 use powdr_expression::{
     visitors::Children, AlgebraicBinaryOperation, AlgebraicBinaryOperator, AlgebraicUnaryOperation,
     AlgebraicUnaryOperator,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;
+use std::io::BufWriter;
+use std::iter::once;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::{collections::BTreeMap, iter::once};
 use symbolic_machine_generator::statements_to_symbolic_machine;
 
 use powdr_number::FieldElement;
 
+pub mod adapter;
 mod bitwise_lookup_optimizer;
+pub mod blocks;
 pub mod bus_map;
 pub mod constraint_optimizer;
 pub mod expression;
@@ -29,6 +33,43 @@ pub mod powdr;
 mod stats_logger;
 pub mod symbolic_machine_generator;
 pub use powdr_constraint_solver::inliner::DegreeBound;
+
+#[derive(Clone)]
+pub struct PowdrConfig {
+    /// Number of autoprecompiles to generate.
+    pub autoprecompiles: u64,
+    /// Number of basic blocks to skip for autoprecompiles.
+    /// This is either the largest N if no PGO, or the costliest N with PGO.
+    pub skip_autoprecompiles: u64,
+    /// Max degree of constraints.
+    pub degree_bound: DegreeBound,
+    /// The path to the APC candidates dir, if any.
+    pub apc_candidates_dir_path: Option<PathBuf>,
+    /// The opcode id of the first APC instruction. Other APC instructions will have consecutive ids.
+    pub first_apc_opcode: usize,
+}
+
+impl PowdrConfig {
+    pub fn new(
+        autoprecompiles: u64,
+        skip_autoprecompiles: u64,
+        degree_bound: DegreeBound,
+        first_apc_opcode: usize,
+    ) -> Self {
+        Self {
+            autoprecompiles,
+            skip_autoprecompiles,
+            degree_bound,
+            apc_candidates_dir_path: None,
+            first_apc_opcode,
+        }
+    }
+
+    pub fn with_apc_candidates_dir<P: AsRef<Path>>(mut self, path: P) -> Self {
+        self.apc_candidates_dir_path = Some(path.as_ref().to_path_buf());
+        self
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SymbolicInstructionStatement<T> {
@@ -115,6 +156,12 @@ pub enum BusInteractionKind {
 pub struct SymbolicMachine<T> {
     pub constraints: Vec<SymbolicConstraint<T>>,
     pub bus_interactions: Vec<SymbolicBusInteraction<T>>,
+}
+
+impl<T: Clone + Ord + std::fmt::Display> SymbolicMachine<T> {
+    pub fn main_columns(&self) -> impl Iterator<Item = AlgebraicReference> + use<'_, T> {
+        self.unique_references()
+    }
 }
 
 impl<T: Display> Display for SymbolicMachine<T> {
@@ -232,31 +279,66 @@ impl<T: FieldElement> PcLookupBusInteraction<T> {
 }
 
 /// A configuration of a VM in which execution is happening.
-pub struct VmConfig<'a, T: FieldElement, B> {
+pub struct VmConfig<'a, M, B> {
     /// Maps an opcode to its AIR.
-    pub instruction_machines: &'a BTreeMap<usize, SymbolicMachine<T>>,
+    pub instruction_machine_handler: &'a M,
     /// The bus interaction handler, used by the constraint solver to reason about bus interactions.
     pub bus_interaction_handler: B,
     /// The bus map that maps bus id to bus type
     pub bus_map: BusMap,
 }
 
-pub fn build<T: FieldElement, B: BusInteractionHandler<T> + IsBusStateful<T> + Clone>(
-    program: Vec<SymbolicInstructionStatement<T>>,
-    vm_config: VmConfig<T, B>,
+// We implement Clone manually because deriving it adds a Clone bound to the `InstructionMachineHandler`
+impl<'a, M, B: Clone> Clone for VmConfig<'a, M, B> {
+    fn clone(&self) -> Self {
+        VmConfig {
+            instruction_machine_handler: self.instruction_machine_handler,
+            bus_interaction_handler: self.bus_interaction_handler.clone(),
+            bus_map: self.bus_map.clone(),
+        }
+    }
+}
+
+pub trait InstructionMachineHandler<T, I> {
+    /// Returns the AIR for the given opcode.
+    fn get_instruction_air(&self, instruction: &I) -> Option<&SymbolicMachine<T>>;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Apc<T, I> {
+    pub block: BasicBlock<I>,
+    pub opcode: u32,
+    pub machine: SymbolicMachine<T>,
+    pub subs: Vec<Vec<u64>>,
+}
+
+impl<T, I> Apc<T, I> {
+    pub fn subs(&self) -> &[Vec<u64>] {
+        &self.subs
+    }
+
+    pub fn machine(&self) -> &SymbolicMachine<T> {
+        &self.machine
+    }
+}
+
+pub fn build<A: Adapter>(
+    block: BasicBlock<A::Instruction>,
+    vm_config: VmConfig<A::InstructionMachineHandler, A::BusInteractionHandler>,
     degree_bound: DegreeBound,
     opcode: u32,
-) -> Result<(SymbolicMachine<T>, Vec<Vec<u64>>), crate::constraint_optimizer::Error> {
-    let (machine, subs) = statements_to_symbolic_machine(
-        &program,
-        vm_config.instruction_machines,
+    apc_candidates_dir_path: Option<&Path>,
+) -> Result<AdapterApc<A>, crate::constraint_optimizer::Error> {
+    let (machine, subs) = statements_to_symbolic_machine::<A>(
+        &block.statements,
+        vm_config.instruction_machine_handler,
         &vm_config.bus_map,
     );
 
     let machine = optimizer::optimize(
         machine,
         vm_config.bus_interaction_handler,
-        Some(opcode),
+        opcode,
         degree_bound,
         &vm_config.bus_map,
     )?;
@@ -264,13 +346,33 @@ pub fn build<T: FieldElement, B: BusInteractionHandler<T> + IsBusStateful<T> + C
     // add guards to constraints that are not satisfied by zeroes
     let machine = add_guards(machine, vm_config.bus_map);
 
-    Ok((machine, subs))
+    let machine = convert_machine(machine, &A::into_field);
+
+    let apc = Apc {
+        block,
+        machine,
+        subs,
+        opcode,
+    };
+
+    if let Some(path) = apc_candidates_dir_path {
+        let ser_path = path
+            .join(format!("apc_candidate_{opcode}"))
+            .with_extension("cbor");
+        std::fs::create_dir_all(path).expect("Failed to create directory for APC candidates");
+        let file =
+            std::fs::File::create(&ser_path).expect("Failed to create file for APC candidate");
+        let writer = BufWriter::new(file);
+        serde_cbor::to_writer(writer, &apc).expect("Failed to write APC candidate to file");
+    }
+
+    Ok(apc)
 }
 
 fn satisfies_zero_witness<T: FieldElement>(expr: &AlgebraicExpression<T>) -> bool {
     let mut zeroed_expr = expr.clone();
     powdr::make_refs_zero(&mut zeroed_expr);
-    let zeroed_expr = algebraic_to_quadratic_symbolic_expression(&zeroed_expr);
+    let zeroed_expr = algebraic_to_grouped_expression(&zeroed_expr);
     zeroed_expr.try_to_number().unwrap().is_zero()
 }
 

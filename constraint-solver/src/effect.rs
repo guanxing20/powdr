@@ -3,25 +3,25 @@ use std::fmt::{self, Display, Formatter};
 use itertools::Itertools;
 use powdr_number::FieldElement;
 
-use crate::{range_constraint::RangeConstraint, symbolic_expression::SymbolicExpression};
+use crate::{range_constraint::RangeConstraint, runtime_constant::RuntimeConstant};
 
 /// The effect of solving a symbolic equation.
 #[derive(Clone, PartialEq, Eq)]
-pub enum Effect<T: FieldElement, V> {
+pub enum Effect<T: RuntimeConstant, V> {
     /// Variable can be assigned a value.
-    Assignment(V, SymbolicExpression<T, V>),
+    Assignment(V, T),
     /// Perform a bit decomposition of a known value, and assign multiple variables.
     BitDecomposition(BitDecomposition<T, V>),
     /// We learnt a new range constraint on variable.
-    RangeConstraint(V, RangeConstraint<T>),
+    RangeConstraint(V, RangeConstraint<T::FieldType>),
     /// A run-time assertion. If this fails, we have conflicting constraints.
-    Assertion(Assertion<T, V>),
+    Assertion(Assertion<T>),
     /// A variable is assigned one of two alternative expressions, depending on a condition.
     ConditionalAssignment {
         variable: V,
-        condition: Condition<T, V>,
-        in_range_value: SymbolicExpression<T, V>,
-        out_of_range_value: SymbolicExpression<T, V>,
+        condition: Condition<T>,
+        in_range_value: T,
+        out_of_range_value: T,
     },
 }
 
@@ -32,14 +32,14 @@ pub enum Effect<T: FieldElement, V> {
 /// This effect can only be created if the equation has a unique solution.
 /// It might be that it leads to a contradiction, which should result in an assertion failure.
 #[derive(Clone, PartialEq, Eq)]
-pub struct BitDecomposition<T: FieldElement, V> {
+pub struct BitDecomposition<T: RuntimeConstant, V> {
     /// The value that is decomposed.
-    pub value: SymbolicExpression<T, V>,
+    pub value: T,
     /// The components of the decomposition.
-    pub components: Vec<BitDecompositionComponent<T, V>>,
+    pub components: Vec<BitDecompositionComponent<T::FieldType, V>>,
 }
 
-impl<T: FieldElement, V: Display> Display for BitDecomposition<T, V> {
+impl<T: RuntimeConstant + Display, V: Display> Display for BitDecomposition<T, V> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let BitDecomposition { value, components } = self;
         write!(f, "{} := {value};", components.iter().format(" + "))
@@ -81,32 +81,29 @@ impl<T: FieldElement, V: Display> Display for BitDecompositionComponent<T, V> {
 
 /// A run-time assertion. If this fails, we have conflicting constraints.
 #[derive(Clone, PartialEq, Eq)]
-pub struct Assertion<T: FieldElement, V> {
-    pub lhs: SymbolicExpression<T, V>,
-    pub rhs: SymbolicExpression<T, V>,
+pub struct Assertion<T: RuntimeConstant> {
+    pub lhs: T,
+    pub rhs: T,
     /// If this is true, we assert that both sides are equal.
     /// Otherwise, we assert that they are different.
     pub expected_equal: bool,
 }
 
-impl<T: FieldElement, V> Assertion<T, V> {
-    pub fn assert_is_zero(condition: SymbolicExpression<T, V>) -> Effect<T, V> {
-        Self::assert_eq(condition, SymbolicExpression::from(T::from(0)))
+impl<T: RuntimeConstant> Assertion<T> {
+    pub fn assert_is_zero<V>(condition: T) -> Effect<T, V> {
+        Self::assert_eq(condition, T::from_u64(0))
     }
-    pub fn assert_is_nonzero(condition: SymbolicExpression<T, V>) -> Effect<T, V> {
-        Self::assert_neq(condition, SymbolicExpression::from(T::from(0)))
+    pub fn assert_is_nonzero<V>(condition: T) -> Effect<T, V> {
+        Self::assert_neq(condition, T::from_u64(0))
     }
-    pub fn assert_eq(lhs: SymbolicExpression<T, V>, rhs: SymbolicExpression<T, V>) -> Effect<T, V> {
+    pub fn assert_eq<V>(lhs: T, rhs: T) -> Effect<T, V> {
         Effect::Assertion(Assertion {
             lhs,
             rhs,
             expected_equal: true,
         })
     }
-    pub fn assert_neq(
-        lhs: SymbolicExpression<T, V>,
-        rhs: SymbolicExpression<T, V>,
-    ) -> Effect<T, V> {
+    pub fn assert_neq<V>(lhs: T, rhs: T) -> Effect<T, V> {
         Effect::Assertion(Assertion {
             lhs,
             rhs,
@@ -116,7 +113,7 @@ impl<T: FieldElement, V> Assertion<T, V> {
 }
 
 #[derive(Clone, PartialEq, Eq)]
-pub struct Condition<T: FieldElement, V> {
-    pub value: SymbolicExpression<T, V>,
-    pub condition: RangeConstraint<T>,
+pub struct Condition<T: RuntimeConstant> {
+    pub value: T,
+    pub condition: RangeConstraint<T::FieldType>,
 }
